@@ -1,0 +1,1 @@
+# claude-bedrock-auto
