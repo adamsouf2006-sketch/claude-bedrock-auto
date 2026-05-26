@@ -1,23 +1,22 @@
 name: Claude Auto Agent
-
-on:
+'on':
   workflow_dispatch:
     inputs:
       task:
-        description: "Tache pour Claude"
+        description: Tache pour Claude
         required: true
-        default: "Analyse le code et propose des corrections"
+        default: Analyse le code et propose des corrections
   issue_comment:
-    types: [created]
+    types:
+    - created
   issues:
-    types: [opened]
-
+    types:
+    - opened
 jobs:
   claude-task:
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment'
+      && contains(github.event.comment.body, '@claude')) || (github.event_name ==
+      'issues' && contains(github.event.issue.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -25,69 +24,54 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    - name: Installer Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Installer Claude Code
+      run: npm install -g @anthropic-ai/claude-code
+    - name: Lancer Claude
+      env:
+        CLAUDE_CODE_USE_BEDROCK: '1'
+        ANTHROPIC_MODEL: anthropic.claude-sonnet-4-6
+        AWS_REGION: us-east-1
+      run: "if [ \"${{ github.event_name }}\" = \"issue_comment\" ]; then\n  PROMPT=\"\
+        ${{ github.event.comment.body }}\"\nelif [ \"${{ github.event_name }}\" =\
+        \ \"issues\" ]; then\n  PROMPT=\"${{ github.event.issue.title }}: ${{ github.event.issue.body\
+        \ }}\"\nelse\n  PROMPT=\"${{ github.event.inputs.task }}\"\nfi\nclaude -p\
+        \ \"$PROMPT\" --max-turns 25 --allowedTools \"Bash,Read,Write,Edit,Glob,Grep\"\
+        \ | tee /tmp/claude_response.txt\n"
+    - name: Comment on issue
+      if: always() && (github.event_name == 'issue_comment' || github.event_name ==
+        'issues')
+      uses: actions/github-script@v7
+      with:
+        script: "const fs = require('fs');\nlet body = 'Claude a termine la tache.';\n\
+          try {\n  body = fs.readFileSync('/tmp/claude_response.txt', 'utf8');\n \
+          \ if (body.length > 60000) body = body.substring(0, 60000);\n} catch(e)\
+          \ {}\nawait github.rest.issues.createComment({\n  owner: context.repo.owner,\n\
+          \  repo: context.repo.repo,\n  issue_number: context.issue.number,\n  body:\
+          \ '**Claude Bot:**\\n\\n' + body\n});\n"
+    - name: Commit
+      if: always()
+      run: 'git config --global user.name "Claude Bot"
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+        git config --global user.email "claude-bot@users.noreply.github.com"
 
-      - name: Installer Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+        git add -A
 
-      - name: Installer Claude Code
-        run: npm install -g @anthropic-ai/claude-code
+        git diff --cached --quiet || git commit -m "Claude: auto"
 
-      - name: Lancer Claude
-        env:
-          CLAUDE_CODE_USE_BEDROCK: "1"
-          ANTHROPIC_MODEL: anthropic.claude-sonnet-4-6
-          AWS_REGION: us-east-1
-        run: |
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            PROMPT="${{ github.event.comment.body }}"
-          elif [ "${{ github.event_name }}" = "issues" ]; then
-            PROMPT="${{ github.event.issue.title }}: ${{ github.event.issue.body }}"
-          else
-            PROMPT="${{ github.event.inputs.task }}"
-          fi
-          claude -p "$PROMPT" --max-turns 25 --allowedTools "Bash,Read,Write,Edit,Glob,Grep" | tee /tmp/claude_response.txt
+        git push || echo "Pas de changements"
 
-      - name: Comment on issue
-        if: always() && (github.event_name == 'issue_comment' || github.event_name == 'issues')
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let body = 'Claude a termine la tache.';
-            try {
-              body = fs.readFileSync('/tmp/claude_response.txt', 'utf8');
-              if (body.length > 60000) body = body.substring(0, 60000) + '
-
-... (tronque)';
-            } catch(e) {}
-            const issueNumber = context.issue.number;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber,
-              body: '**Claude Bot:**
-
-' + body
-            });
-
-      - name: Commit
-        if: always()
-        run: |
-          git config --global user.name "Claude Bot"
-          git config --global user.email "claude-bot@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || git commit -m "Claude: auto"
-          git push || echo "Pas de changements"
+        '
