@@ -38,8 +38,8 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: us-east-1
-          ANTHROPIC_MODEL: us.anthropic.claude-sonnet-4-20250514
-          AWS_BEDROCK_BASE_URL: https://bedrock-runtime.us-east-1.amazonaws.com
+          ANTHROPIC_MODEL: anthropic.claude-sonnet-4-6
+          DISABLE_PROMPT_CACHING: "1"
         run: |
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
             PROMPT="${{ github.event.comment.body }}"
