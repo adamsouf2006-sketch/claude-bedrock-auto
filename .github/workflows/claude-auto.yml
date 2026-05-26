@@ -26,34 +26,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Installer Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: "22"
-      - name: Installer Claude Code
-        run: npm install -g @anthropic-ai/claude-code
-      - name: Lancer Claude
+          fetch-depth: 0
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          use_bedrock: "true"
+          model: "anthropic.claude-sonnet-4-6"
+          prompt: |
+            ${{ github.event_name == 'issue_comment' && github.event.comment.body || github.event_name == 'issues' && format('{0}: {1}', github.event.issue.title, github.event.issue.body) || github.event.inputs.task }}
+          claude_args: "--max-turns 25"
         env:
-          CLAUDE_CODE_USE_BEDROCK: "1"
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: us-east-1
-          ANTHROPIC_MODEL: anthropic.claude-sonnet-4-6
-          DISABLE_PROMPT_CACHING: "1"
-        run: |
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            PROMPT="${{ github.event.comment.body }}"
-          elif [ "${{ github.event_name }}" = "issues" ]; then
-            PROMPT="${{ github.event.issue.title }}: ${{ github.event.issue.body }}"
-          else
-            PROMPT="${{ github.event.inputs.task }}"
-          fi
-          claude -p "$PROMPT" --max-turns 25
-      - name: Commit
-        if: always()
-        run: |
-          git config --global user.name "Claude Bot"
-          git config --global user.email "claude-bot@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || git commit -m "Claude: auto"
-          git push || echo "Pas de changements"
