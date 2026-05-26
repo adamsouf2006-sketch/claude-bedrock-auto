@@ -1,4 +1,4 @@
-﻿name: Claude Auto Agent
+name: Claude Auto Agent
 
 on:
   workflow_dispatch:
@@ -7,19 +7,29 @@ on:
         description: "Tache pour Claude"
         required: true
         default: "Analyse le code et propose des corrections"
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened]
 
 jobs:
   claude-task:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Installer Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       - name: Installer Claude Code
         run: npm install -g @anthropic-ai/claude-code
       - name: Lancer Claude
@@ -27,9 +37,17 @@ jobs:
           CLAUDE_CODE_USE_BEDROCK: "1"
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          ANTHROPIC_MODEL: "anthropic.claude-sonnet-4-20250514"
-        run: claude -p "${{ github.event.inputs.task }}"
+          AWS_REGION: us-east-1
+          ANTHROPIC_MODEL: us.anthropic.claude-sonnet-4-20250514
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            PROMPT="${{ github.event.comment.body }}"
+          elif [ "${{ github.event_name }}" = "issues" ]; then
+            PROMPT="${{ github.event.issue.title }}: ${{ github.event.issue.body }}"
+          else
+            PROMPT="${{ github.event.inputs.task }}"
+          fi
+          claude -p "$PROMPT" --max-turns 25
       - name: Commit
         if: always()
         run: |
