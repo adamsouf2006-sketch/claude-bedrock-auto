@@ -61,28 +61,26 @@ jobs:
           claude -p "$PROMPT" --max-turns 25 --allowedTools "Bash,Read,Write,Edit,Glob,Grep" | tee /tmp/claude_response.txt
 
       - name: Comment on issue
-        if: (github.event_name == 'issue_comment' || github.event_name == 'issues') && always()
+        if: always() && (github.event_name == 'issue_comment' || github.event_name == 'issues')
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let body = 'Claude a terminé la tâche.';
+            let body = 'Claude a termine la tache.';
             try {
               body = fs.readFileSync('/tmp/claude_response.txt', 'utf8');
               if (body.length > 60000) body = body.substring(0, 60000) + '
 
-... (tronqué)';
+... (tronque)';
             } catch(e) {}
             const issueNumber = context.issue.number;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: issueNumber,
-              body: '🤖 **Claude Bot:**
+              body: '**Claude Bot:**
 
-```
-' + body + '
-```'
+' + body
             });
 
       - name: Commit
