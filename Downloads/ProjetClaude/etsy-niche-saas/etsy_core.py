@@ -126,12 +126,25 @@ NICHE_TAXONOMY = [
     "Autre deco maison",
 ]
 
-def _ai_refine_chunk(chunk):
+def _ai_refine_chunk(chunk, query=""):
     """1 appel LLM pour un lot de boutiques. Agent autonome: classe chaque boutique
-    en examinant ses titres UN PAR UN puis decide la niche majoritaire."""
+    en examinant ses titres UN PAR UN puis decide la niche majoritaire. Si `query`
+    fournie, l'IA juge AUSSI la pertinence semantique vs la recherche (ex: 'support'
+    = un support/socle, PAS 'emotional support')."""
     taxo = "\n".join("  - " + n for n in NICHE_TAXONOMY)
     items = [{"id": s["id"], "titres": (s.get("titles") or [s.get("sample", "")])[:20]}
              for s in chunk]
+    rel_rule = ""
+    rel_field = ""
+    if query:
+        rel_rule = (
+            "\nPERTINENCE RECHERCHE: l'utilisateur cherche le PRODUIT \"" + query + "\". "
+            "Comprends-le SEMANTIQUEMENT (le vrai objet voulu), pas comme une chaine de "
+            "caracteres. Ex: 'support' = un socle/support/presentoir physique, PAS "
+            "'emotional support'. 'bougie' = candle. Mets match=false si la boutique ne "
+            "vend pas majoritairement ce produit.\n"
+        )
+        rel_field = "\"match\":true,"
     prompt = (
         "Tu es un AGENT autonome d'analyse de niches Etsy pour un dropshipper. Tu recois "
         "plusieurs boutiques, chacune avec la LISTE complete de ses titres produits.\n\n"
@@ -140,11 +153,13 @@ def _ai_refine_chunk(chunk):
         "produit (ex: 'macrame wall hanging' -> decoration murale ; 'soy candle' -> bougie).\n"
         "2. Compte combien de titres tombent dans chaque categorie.\n"
         "3. La niche de la boutique = la categorie MAJORITAIRE (le plus de titres). Ignore "
-        "les titres isoles/exceptions. Une boutique a UNE seule niche dominante.\n\n"
-        "Renvoie par boutique:\n"
+        "les titres isoles/exceptions. Une boutique a UNE seule niche dominante.\n"
+        + rel_rule +
+        "\nRenvoie par boutique:\n"
         "- accept (bool): true SEULEMENT si la majorite des produits sont PHYSIQUES, NON "
         "personnalises, non digitaux, sans vetement/bijou/sticker/porte-cles/electronique/"
         "gadget, pas trop lourds, sans croyance/occulte. Sinon false.\n"
+        + ("- match (bool): true si la boutique vend bien le produit cherche (voir PERTINENCE). Sinon false.\n" if query else "") +
         "- niche (str): EXACTEMENT une valeur de cette liste fermee (recopie telle quelle), "
         "celle qui correspond a la MAJORITE des titres. Jamais inventer, jamais un nom de "
         "produit. Liste autorisee:\n" + taxo + "\n"
@@ -154,7 +169,7 @@ def _ai_refine_chunk(chunk):
         "(led, gadget, deco usine, print-on-demand). 0-0.2 = vrai artisanat unique fait main.\n"
         "- reason (str): 4-8 mots citant le produit dominant observe.\n"
         "Reponds UNIQUEMENT en JSON compact, rien d'autre: "
-        "{\"r\":[{\"id\":\"..\",\"accept\":true,\"niche\":\"..\",\"dropship\":0.1,\"reason\":\"..\"}]}\n"
+        "{\"r\":[{\"id\":\"..\",\"accept\":true," + rel_field + "\"niche\":\"..\",\"dropship\":0.1,\"reason\":\"..\"}]}\n"
         + json.dumps(items, ensure_ascii=False)
     )
     out = {}
@@ -168,20 +183,23 @@ def _ai_refine_chunk(chunk):
             pass
     return out
 
-def ai_refine(shops, batch=20):
+def ai_refine(shops, batch=20, query=""):
     """Cerveau du logiciel. Decoupe en lots et les traite EN PARALLELE (gros gain
     vitesse, le failover de cles reste gere par lot). Par boutique:
       - accept: vrai produit physique vendable (pas perso/digital/vetement/bijou/gadget/lourd).
+      - match: (si query) pertinence semantique vs la recherche.
       - niche: choisie DANS la taxonomie fixe (regroupement reel, pas de nom invente).
       - dropship: 0..1 = proba produits industriels revendus (trouvables identiques sur AliExpress).
-    Retourne dict id -> {accept, niche, dropship, reason}. {} si pas de cle."""
+    Retourne dict id -> {accept, match, niche, dropship, reason}. {} si pas de cle."""
     if not ai_available() or not shops:
         return {}
     pool = shops[:200]
     chunks = [pool[i:i + batch] for i in range(0, len(pool), batch)]
     out = {}
+    from functools import partial
+    work = partial(_ai_refine_chunk, query=query)
     with ThreadPoolExecutor(max_workers=min(AI_WORKERS, len(chunks))) as ex:
-        for d in ex.map(_ai_refine_chunk, chunks):
+        for d in ex.map(work, chunks):
             out.update(d)
     return out
 
@@ -324,7 +342,8 @@ def ai_enrich_shops(shops, f):
       dropship-ables (produits trouvables sur AliExpress), seuil f['dropship_min'] (def 0.5)."""
     if not f.get("use_ai") or not ai_available() or not shops:
         return shops, False
-    verdict = ai_refine(shops)
+    query = (f.get("_query") or "").strip()    # mot-cle traduit EN => pertinence IA
+    verdict = ai_refine(shops, query=query)
     if not verdict:
         return shops, False
     thr = float(f.get("dropship_min", 0.5))
@@ -336,6 +355,8 @@ def ai_enrich_shops(shops, f):
             kept.append(s); continue          # non juge => on garde
         if not v.get("accept", True):
             continue                            # IA rejette: hors cible
+        if query and v.get("match") is False:
+            continue                            # IA: boutique hors-sujet vs la recherche
         niche = snap_niche(v.get("niche"))   # force dans la taxonomie => vrai regroupement
         s["ai_niche"] = niche
         s["_niche"] = niche
@@ -934,6 +955,7 @@ def search_cache(filters=None, keyword=""):
     f = filters or {}
     kw_en, _tr = resolve_keyword(keyword)   # FR -> EN (Etsy/catalogues en anglais)
     kw_en = kw_en.strip().lower()
+    f["_query"] = kw_en          # pertinence IA (jugement semantique vs la recherche)
     # seuil de pertinence: au moins 50% des mots-cles forts presents dans le catalogue
     rel_min = float(f.get("relevance_min", 0.35)) if kw_en else 0.0
     cache = _load()
@@ -1139,6 +1161,7 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     # pertinence: le catalogue de la boutique doit correspondre au mot-cle (deja traduit EN)
     kw_rel = keyword.strip().lower()
     rel_min = float(f.get("relevance_min", 0.35)) if kw_rel else 0.0
+    f["_query"] = kw_rel         # pertinence IA (jugement semantique vs la recherche)
     # ROTATION: chaque run repart la ou le precedent s'est arrete (par mot-cle) =>
     # on scanne de NOUVELLES pages de nouveautes => on ne retombe plus toujours sur
     # les memes boutiques / memes niches.
