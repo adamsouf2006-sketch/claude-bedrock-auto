@@ -241,9 +241,9 @@ FR_EN_WORD = {
 }
 
 def resolve_keyword(kw):
-    """Traduit un mot-cle FR (nom de niche OU mot produit) en anglais pour Etsy.
-    1) mots produit FR connus -> EN (rangement->storage basket...). 2) nom de niche
-    complet -> mots-cles EN. Sinon (deja anglais) on laisse intact.
+    """Traduit un mot-cle FR (nom de niche OU mots produit) en anglais pour Etsy.
+    Traduit CHAQUE mot FR connu et GARDE les mots anglais/inconnus (ex: 'support bois'
+    -> 'support wood'). Sinon nom de niche complet -> mots-cles EN. Sinon intact.
     Retourne (keyword_effectif, traduit_bool)."""
     raw = (kw or "").strip()
     if not raw:
@@ -253,14 +253,16 @@ def resolve_keyword(kw):
     kset = set(w for w in words if len(w) > 2)
     if not kset:
         return raw, False
-    # 1) traduction mot-a-mot via dico FR->EN (gere mots isoles type "rangement")
-    hits = [FR_EN_WORD[w] for w in words if w in FR_EN_WORD]
-    if hits:
-        # dedup en gardant l'ordre, prend la 1ere traduction (mot produit principal)
-        seen = []
-        for h in hits:
-            if h not in seen: seen.append(h)
-        return seen[0], True
+    # 1) traduction mot-a-mot: traduit les mots FR connus, garde les mots EN/inconnus
+    tokens = []; translated = False
+    for w in words:
+        if w in FR_EN_WORD:
+            tokens += FR_EN_WORD[w].split(); translated = True
+        elif len(w) > 2:
+            tokens.append(w)               # mot deja anglais (ex: 'support')
+    if translated:
+        seen = list(dict.fromkeys(tokens))  # dedup, garde l'ordre
+        return " ".join(seen), True
     # 2) nom de niche complet -> mots-cles EN (seuil 60% des mots de la niche)
     norm = lambda s: set(w for w in _re.findall(r"[a-z]+", _strip_accents(s).lower()) if len(w) > 2)
     best, score = None, 0.0
@@ -274,6 +276,23 @@ def resolve_keyword(kw):
     if best and score >= 0.6:
         return best, True
     return raw, False
+
+# Mots trop generiques pour servir de filtre de pertinence a eux seuls.
+_REL_GENERIC = {"decor", "home", "handmade", "gift", "set", "wall", "art", "deco", "custom"}
+
+def keyword_relevance(titles, kw_en):
+    """Pertinence boutique vs mot-cle (traduit EN). = part des TITRES du catalogue
+    qui contiennent un mot-cle fort. Mesure la DOMINANCE: une boutique crochet avec
+    1 seul article 'wood' obtient ~0.02 (rejetee), une vraie boutique bois ~0.8.
+    Evite de retenir une boutique sur 1 produit isole matche par Etsy."""
+    import re as _re
+    toks = [w for w in _re.findall(r"[a-z]+", (kw_en or "").lower()) if len(w) > 2]
+    strong = [w for w in toks if w not in _REL_GENERIC] or toks
+    if not strong or not titles:
+        return 1.0
+    low = [t.lower() for t in titles]
+    n = sum(1 for t in low if any(w in t for w in strong))
+    return n / len(low)
 
 def snap_niche(name):
     """Force une niche IA dans la taxonomie fixe (tolerant aux variantes). Retourne
@@ -913,15 +932,18 @@ def search_cache(filters=None, keyword=""):
     """Filtre la base locale de boutiques deja enrichies. ZERO requete API.
     Renvoie potentiellement des centaines de boutiques instantanement."""
     f = filters or {}
-    kw = keyword.strip().lower()
+    kw_en, _tr = resolve_keyword(keyword)   # FR -> EN (Etsy/catalogues en anglais)
+    kw_en = kw_en.strip().lower()
+    # seuil de pertinence: au moins 50% des mots-cles forts presents dans le catalogue
+    rel_min = float(f.get("relevance_min", 0.35)) if kw_en else 0.0
     cache = _load()
     shops = []
     for rec in cache.values():
         if rec.get("sold") is None or rec.get("error"):
             continue
         titles = shop_titles(rec)
-        full = " || ".join(titles).lower()  # TOUT le catalogue
-        if kw and kw not in full:
+        # FILTRE PERTINENCE: la boutique doit VRAIMENT vendre ce qui est cherche
+        if kw_en and keyword_relevance(titles, kw_en) < rel_min:
             continue
         # rejet PROPORTIONNEL (intelligent): perso/digital/categorie bannie/lourd
         # seulement si ca DOMINE le catalogue.
@@ -1114,6 +1136,9 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     cache = _load()
     shops = []; processed = set()
     listing_calls = 0; kept_listings = 0; seen_listings = 0; enriched_calls = 0
+    # pertinence: le catalogue de la boutique doit correspondre au mot-cle (deja traduit EN)
+    kw_rel = keyword.strip().lower()
+    rel_min = float(f.get("relevance_min", 0.35)) if kw_rel else 0.0
     # ROTATION: chaque run repart la ou le precedent s'est arrete (par mot-cle) =>
     # on scanne de NOUVELLES pages de nouveautes => on ne retombe plus toujours sur
     # les memes boutiques / memes niches.
@@ -1205,8 +1230,11 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
                         enriched_calls += 1
                         cache[r["id"]] = r
                 _save(cache)
-        # 5) ajout au resultat
+        # 5) ajout au resultat (avec FILTRE PERTINENCE: le catalogue doit vraiment
+        # correspondre au mot-cle tape, pas juste 1 produit isole matche par Etsy)
         for rec in keep_recs:
+            if kw_rel and keyword_relevance(shop_titles(rec), kw_rel) < rel_min:
+                continue
             shops.append(rec)
             if progress: progress(len(shops), seen_listings)
             if len(shops) >= target_count: break
