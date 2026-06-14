@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NicheScout — trouver des niches Etsy</title>
+<style>
+  :root{--bg:#0f1115;--card:#181b22;--line:#262b36;--txt:#e7ebf0;--mut:#8b94a3;--acc:#ff7a59;--ok:#3ecf8e;--blue:#5b9dff}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.55 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+  header{padding:16px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px}
+  header .logo{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--acc),#ffb199);display:grid;place-items:center;font-weight:800;color:#1a1a1a}
+  header h1{font-size:17px;margin:0}
+  .quota{margin-left:auto;color:var(--mut);font-size:12px}
+  .guide{margin:14px 24px 0;background:#11161f;border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .guide b{color:var(--blue)}
+  .steps{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+  .steps div{background:#0e1014;border:1px solid var(--line);border-radius:20px;padding:4px 12px;font-size:12px;color:var(--mut)}
+  .steps b{color:var(--txt)}
+  .wrap{display:grid;grid-template-columns:320px 1fr;gap:18px;padding:18px 24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin:0 0 10px}
+  label{display:block;font-size:12px;color:var(--mut);margin:12px 0 4px}
+  label .i{color:var(--blue);cursor:help}
+  input,select{width:100%;background:#0e1014;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px}
+  .row{display:flex;gap:8px}
+  .chk{display:flex;align-items:center;gap:8px;margin:7px 0;font-size:13px}
+  .chk input{width:auto}
+  button{margin-top:14px;width:100%;background:var(--acc);color:#1a1a1a;font-weight:700;border:0;border-radius:9px;padding:12px;cursor:pointer;font-size:14px}
+  button.sec{background:#2b303b;color:var(--txt);font-weight:600}
+  button:disabled{opacity:.5;cursor:wait}
+  details{margin-top:12px;border-top:1px solid var(--line);padding-top:8px}
+  summary{cursor:pointer;color:var(--mut);font-size:12px}
+  .cats{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+  .cats span{font-size:11px;border:1px solid var(--line);border-radius:20px;padding:3px 9px;cursor:pointer;color:var(--mut)}
+  .cats span.on{background:var(--acc);color:#1a1a1a;border-color:var(--acc)}
+  .stat{display:flex;gap:18px;margin-bottom:14px;flex-wrap:wrap}
+  .stat div b{display:block;font-size:22px}
+  .stat div span{color:var(--mut);font-size:12px}
+  .niche{margin-bottom:10px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .niche h3{margin:0;padding:11px 14px;background:#141821;font-size:14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+  .niche h3 .pill{background:var(--ok);color:#06281a;border-radius:20px;padding:1px 10px;font-size:12px;font-weight:700}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 12px;border-top:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:500}
+  td a.shop{color:var(--acc);text-decoration:none;font-weight:600}
+  .ali{display:inline-block;background:#ff4747;color:#fff;border-radius:6px;padding:2px 7px;font-size:11px;text-decoration:none;white-space:nowrap}
+  .mut{color:var(--mut)}
+  .empty{padding:40px;text-align:center;color:var(--mut)}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid #fff5;border-top-color:#fff;border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
+  @keyframes s{to{transform:rotate(360deg)}}
+  .tip{font-size:11px;color:var(--mut);margin-top:4px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">N</div>
+  <h1>NicheScout <span class="mut" style="font-weight:400">· trouver des niches Etsy à dropshipper</span></h1>
+  <div class="quota" id="quota">quota API: …</div>
+</header>
+
+<div class="guide">
+  <b>Comment ça marche</b> — Une <b>niche</b> = une catégorie de marché (ex : <i>boissons</i>). Un <b>produit</b> = un article de cette niche (ex : <i>bouteille d'eau</i>). L'outil trouve des boutiques Etsy <b>jeunes qui vendent beaucoup</b>, lit <b>tous leurs titres produits</b> pour deviner leur niche, puis les regroupe.
+  <div class="steps">
+    <div>1 · <b>Source</b> (Base locale = gratuit)</div>
+    <div>2 · <b>Nombre de boutiques</b> voulu</div>
+    <div>3 · <b>Filtres</b> (jeune, ventes/mois)</div>
+    <div>4 · <b>Trouver</b> → niches</div>
+    <div>5 · <b>AliExpress</b> 🔴 = vérifier si le produit existe (recherche image via extension)</div>
+  </div>
+</div>
+
+<div class="wrap">
+  <!-- PARAMETRES -->
+  <div class="card">
+    <h2>1 · Source</h2>
+    <select id="source">
+      <option value="cache">⚡ Base locale (0 requête, instantané)</option>
+      <option value="scrape">🕷️ Scraping navigateur (0 requête, lent)</option>
+      <option value="live">🌐 API live (1 crédit / boutique)</option>
+    </select>
+    <div class="tip" id="src_hint"></div>
+
+    <h2 style="margin-top:16px">2 · Combien de boutiques ?</h2>
+    <input id="target" type="number" value="100" min="1" max="1000">
+    <div class="tip">Nombre exact voulu (max 1000). Marche pour les 3 modes.</div>
+    <label>Min boutiques par niche <span class="i" title="Masque les niches qui ont moins de N boutiques (1 = tout afficher)">ⓘ</span></label>
+    <input id="min_per_niche" type="number" value="5" min="1" max="50">
+    <div class="tip">Ex: 5 = n'affiche que les niches avec ≥5 boutiques. Astuce: mets un mot-clé de niche (ex « suncatcher ») pour avoir de la profondeur.</div>
+
+    <h2 style="margin-top:16px">3 · Filtres boutique</h2>
+    <label>Mot-clé <span class="mut">(optionnel — filtre le produit)</span></label>
+    <input id="keyword" placeholder="ex: candle  ·  ou laisser vide">
+
+    <div class="row">
+      <div style="flex:1"><label>Ventes/mois min <span class="i" title="Plus haut = boutiques qui cartonnent">ⓘ</span></label><input id="min_rate" type="number" value="5"></div>
+      <div style="flex:1"><label>Âge max (mois) <span class="i" title="Boutiques jeunes : 12 = moins d'1 an">ⓘ</span></label><input id="max_age" type="number" value="36"></div>
+    </div>
+
+    <details>
+      <summary>Filtres avancés</summary>
+      <div class="row">
+        <div style="flex:1"><label>Âge min (mois)</label><input id="min_age" type="number" value="1"></div>
+        <div style="flex:1"><label>Ventes totales min</label><input id="min_sold" type="number" value="0"></div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>Prix min ($)</label><input id="min_price" type="number" value="10"></div>
+        <div style="flex:1"><label>Poids max (g)</label><input id="max_weight" type="number" value="2000"></div>
+      </div>
+      <div style="margin-top:8px">
+        <div class="chk"><input type="checkbox" id="ex_perso" checked> Exclure personnalisé</div>
+        <div class="chk"><input type="checkbox" id="ex_digital" checked> Exclure digital</div>
+        <div class="chk"><input type="checkbox" id="ex_supply" checked> Exclure matières premières</div>
+        <div class="chk"><input type="checkbox" id="ex_vintage" checked> Exclure vintage / revente</div>
+        <div class="chk"><input type="checkbox" id="ex_heavy" checked> Exclure produits lourds</div>
+        <div class="chk"><input type="checkbox" id="ex_custom"> Exclure boutiques "custom"</div>
+        <div class="chk"><input type="checkbox" id="fetch_titles" checked> Niche précise (catalogue complet, 2 crédits/boutique)</div>
+        <div class="chk" style="padding-left:24px"><span class="tip" style="margin:0">Décoché = niche rapide depuis 1 titre (1 crédit/boutique, 2× plus de boutiques)</span></div>
+        <div class="chk"><input type="checkbox" id="use_ai"> 🤖 Classement IA (si clé)</div>
+        <div class="chk"><input type="checkbox" id="validate_ali"> 🔴 Valider sur AliExpress (image+texte)</div>
+        <div class="chk" style="padding-left:24px"><input type="checkbox" id="ali_gate" checked> Ne garder que les boutiques validées</div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>Produits testés/boutique</label><input id="ali_products" type="number" value="10" min="1" max="20"></div>
+        <div style="flex:1"><label>Min produits trouvés</label><input id="ali_min_match" type="number" value="3" min="1" max="20"></div>
+      </div>
+      <div class="tip">Gratuit (scrapling furtif, 0 crédit API). Recherche TEXTE sur AliExpress. ⚠️ AliExpress met parfois un CAPTCHA → statut "❔ bloqué" (boutique gardée). Lent (~5s/produit). Le bouton 🔴 reste dispo pour vérifier à la main.</div>
+      <label>Catégories à exclure</label>
+      <div class="cats" id="cats"></div>
+    </details>
+
+    <button id="go" onclick="run()">🔍 Trouver des niches</button>
+    <button class="sec" onclick="exportCsv()">⬇ Export CSV</button>
+
+    <details style="margin-top:14px">
+      <summary>Fiabiliser la base (API)</summary>
+      <div class="tip">Récupère les titres manquants des boutiques (1 crédit/boutique) pour un classement niche plus précis.</div>
+      <div class="row" style="margin-top:6px">
+        <input id="cc_limit" type="number" value="50" style="flex:1">
+        <button class="sec" id="cc" onclick="completeCatalogs()" style="flex:2;margin-top:0">🔄 Compléter</button>
+      </div>
+      <div class="tip" id="cc_status"></div>
+    </details>
+  </div>
+
+  <!-- RESULTATS -->
+  <div>
+    <div class="card">
+      <div class="stat" id="stat"><div class="empty" style="width:100%">Choisis une source + un nombre de boutiques, puis clique « Trouver des niches ».</div></div>
+      <div id="clusters"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const CATS=["vetements","digital","bijoux","stickers","electronique","gadget","croyance","plantes","fandom_replica","taxidermie"];
+const CATLABEL={vetements:"Vêtements",digital:"Digital",bijoux:"Bijoux",stickers:"Stickers/porte-clés",electronique:"Électronique",gadget:"Gadgets",croyance:"Croyance",plantes:"Plantes",fandom_replica:"Fandom/répliques",taxidermie:"Taxidermie"};
+const sel=new Set(CATS), catsEl=document.getElementById("cats");
+CATS.forEach(c=>{const s=document.createElement("span");s.textContent=CATLABEL[c];s.className="on";
+  s.onclick=()=>{sel.has(c)?sel.delete(c):sel.add(c);s.className=sel.has(c)?"on":"";};catsEl.appendChild(s);});
+
+const HINTS={cache:"Cherche dans les ~2000 boutiques déjà collectées. Instantané, 0 requête.",
+ scrape:"Ouvre un navigateur et scrape Etsy + tout le catalogue de chaque boutique. Lent (~5s/boutique), 0 crédit API.",
+ live:"Découvre de nouvelles boutiques via l'API Etsy. 1 crédit par boutique (s'arrête au nombre voulu)."};
+const srcEl=document.getElementById("source"),hintEl=document.getElementById("src_hint");
+srcEl.onchange=()=>hintEl.textContent=HINTS[srcEl.value];hintEl.textContent=HINTS.cache;
+
+const val=id=>document.getElementById(id).value, chk=id=>document.getElementById(id).checked;
+function params(){
+  return new URLSearchParams({
+    source:val("source"), keyword:val("keyword"), target_count:val("target"),
+    min_rate:val("min_rate"), max_age_months:val("max_age"), min_age_months:val("min_age"),
+    min_sold:val("min_sold"), min_price:val("min_price"), max_weight_g:val("max_weight"),
+    exclude_perso:chk("ex_perso"), exclude_digital:chk("ex_digital"), exclude_supply:chk("ex_supply"),
+    exclude_vintage:chk("ex_vintage"), exclude_heavy:chk("ex_heavy"), exclude_custom_shops:chk("ex_custom"),
+    use_ai:chk("use_ai"), exclude_categories:[...sel].join(","),
+    min_per_niche:val("min_per_niche"),
+    validate_ali:chk("validate_ali"), ali_gate:chk("ali_gate"),
+    ali_products:val("ali_products"), ali_min_match:val("ali_min_match"),
+    fetch_titles:chk("fetch_titles")
+  });
+}
+async function quota(){try{const r=await(await fetch("/api/quota",{cache:"no-store"})).json();
+  const rem=r.remaining_today??"?",lim=r.limit??5000;
+  document.getElementById("quota").textContent="quota API: "+rem+" / "+lim;}catch(e){}}
+quota();
+// compteur quota TEMPS REEL: rafraichi en continu (et reset auto a 5000 a minuit UTC cote serveur)
+setInterval(quota,15000);
+
+function tbl(shops){
+  const hasAli=shops.some(s=>s.ali_hits!=null);
+  let h=`<table><thead><tr><th>Boutique</th><th>Pays</th><th>Ventes/mois</th><th>Total</th><th>Âge</th><th>Conf.</th>${hasAli?"<th>Dropship</th>":""}<th>Produit</th><th>AliExpress</th></tr></thead><tbody>`;
+  for(const s of shops){
+    const conf=s.niche_conf!=null?Math.round(s.niche_conf*100)+"%":"—";
+    let aliCell="";
+    if(hasAli){
+      const via=s.ali_via?Object.keys(s.ali_via).join("/"):"";
+      const icon=s.ali_blocked?"❔":(s.ali_validated?"✅":"❌");
+      aliCell=`<td>${icon} <span class="mut">${s.ali_blocked?"bloqué":(s.ali_hits??0)}${via?" ·"+via:""}</span></td>`;
+    }
+    h+=`<tr>
+      <td><a class="shop" href="${s.url}" target="_blank">${s.name||s.id}</a></td>
+      <td class="mut">${s.country||"—"}</td><td><b>${s.rate}</b></td>
+      <td>${s.sold}</td><td class="mut">${s.months} mo</td><td class="mut">${conf}</td>
+      ${aliCell}
+      <td class="mut">${(s.sample||"").slice(0,55)}</td>
+      <td>${s.ali_url?`<a class="ali" href="${s.ali_url}" target="_blank">🔴 chercher</a>`:""}</td>
+    </tr>`;
+  }
+  return h+"</tbody></table>";
+}
+let _es=null;
+function liveStat(matched,scanned,target){
+  document.getElementById("stat").innerHTML=`
+    <div><b style="color:var(--acc)">${matched}</b><span>boutiques trouvées / ${target}</span></div>
+    <div><b>${scanned}</b><span>analysées</span></div>
+    <div style="width:100%;color:var(--mut)"><span class="spin"></span> recherche en cours… (fenêtres masquées)</div>`;
+}
+async function run(){
+  const btn=document.getElementById("go");btn.disabled=true;btn.innerHTML='<span class="spin"></span> Recherche…';
+  const target=parseInt(val("target"))||0;
+  if(_es){_es.close();_es=null;}
+  liveStat(0,0,target);
+  // flux temps reel: compteur de boutiques mis a jour en direct pendant la recherche
+  _es=new EventSource("/api/discover_stream?"+params());
+  _es.onmessage=(ev)=>{
+    let m;try{m=JSON.parse(ev.data);}catch(e){return;}
+    if(m.type==="progress"){liveStat(m.matched,m.scanned,target);}
+    else if(m.type==="done"){_es.close();_es=null;render(m.result);
+      btn.disabled=false;btn.textContent="🔍 Trouver des niches";quota();}
+    else if(m.type==="error"){_es.close();_es=null;
+      document.getElementById("stat").innerHTML='<div class="empty">Erreur: '+m.error+'</div>';
+      btn.disabled=false;btn.textContent="🔍 Trouver des niches";}
+  };
+  _es.onerror=()=>{ if(_es){_es.close();_es=null;}
+    document.getElementById("stat").innerHTML='<div class="empty">Connexion interrompue. Relance la recherche.</div>';
+    btn.disabled=false;btn.textContent="🔍 Trouver des niches";};
+}
+function render(r){
+  let extra;
+  if(r.source==="cache")extra=`<div><b>${r.available??r.matched}</b><span>dispo en base</span></div>`;
+  else if(r.source==="scrape")extra=`<div><b>${r.scraped}</b><span>boutiques scrapées</span></div>`;
+  else extra=`<div><b>${r.listings_kept}/${r.listings_seen}</b><span>produits filtrés</span></div>`;
+  document.getElementById("stat").innerHTML=`
+    <div><b>${r.matched}</b><span>boutiques trouvées</span></div>
+    <div><b>${r.clusters.length}</b><span>niches</span></div>
+    <div><b style="color:var(--ok)">${r.api_used}</b><span>crédits API</span></div>
+    ${extra}
+    <div><b>${r.quota_remaining??"?"}</b><span>quota restant</span></div>`;
+  const c=document.getElementById("clusters");
+  if(!r.clusters.length){c.innerHTML='<div class="empty">Aucune boutique. Assouplis les filtres (baisse ventes/mois, monte l’âge max).</div>';return;}
+  c.innerHTML=r.clusters.map((n,i)=>`<div class="niche">
+    <h3 onclick="const d=this.nextElementSibling;d.style.display=d.style.display==='none'?'block':'none'">
+      <span>📦 <b>${n.niche}</b></span><span class="pill">${n.count} boutiques</span></h3>
+    <div style="display:${i<3?'block':'none'}">${tbl(n.shops)}</div></div>`).join("");
+}
+function exportCsv(){window.open("/api/export?"+params().toString(),"_blank");}
+async function completeCatalogs(){
+  const b=document.getElementById("cc");b.disabled=true;b.textContent="…";
+  const st=document.getElementById("cc_status");
+  try{const r=await(await fetch("/api/complete_catalogs?limit="+val("cc_limit"))).json();
+    st.textContent=`${r.completed} complétées · ${r.api_used} crédits · ${r.remaining_monotitle} restantes`;quota();run();}
+  catch(e){st.textContent="Erreur: "+e;}
+  finally{b.disabled=false;b.textContent="🔄 Compléter";}
+}
+</script>
+</body>
+</html>
