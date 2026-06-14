@@ -213,27 +213,64 @@ def _strip_accents(s):
     import unicodedata
     return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
 
+# Mots FR -> mots-cles EN pour la recherche Etsy (index anglais). Etsy ne comprend
+# PAS le francais: "rangement", "bougie", "tapis"... renvoient n'importe quoi. On
+# traduit les mots produit courants. Cle = mot FR sans accent, minuscule.
+FR_EN_WORD = {
+    "rangement": "storage basket", "panier": "woven basket", "paniers": "woven basket",
+    "boite": "storage box", "boites": "storage box", "corbeille": "woven basket",
+    "bougie": "candle", "bougies": "candle", "senteur": "scented candle",
+    "tapis": "rug", "paillasson": "doormat", "carpette": "rug",
+    "coussin": "pillow cover", "coussins": "pillow cover", "housse": "pillow cover",
+    "linge": "linen", "couverture": "throw blanket", "plaid": "throw blanket",
+    "sac": "tote bag", "sacs": "tote bag", "pochette": "pouch", "trousse": "pouch",
+    "vase": "ceramic vase", "ceramique": "ceramic", "poterie": "pottery",
+    "miroir": "wall mirror", "cadre": "picture frame", "affiche": "art print",
+    "macrame": "macrame wall hanging", "tenture": "wall hanging", "suspension": "wall hanging",
+    "plateau": "serving tray", "videpoche": "trinket tray", "coupelle": "trinket dish",
+    "savon": "soap bar", "bain": "bath", "diffuseur": "reed diffuser", "encens": "incense holder",
+    "peluche": "crochet plush", "peluches": "crochet plush", "crochet": "crochet",
+    "bois": "wood decor", "cheveux": "hair clip", "barrette": "hair clip", "chouchou": "scrunchie",
+    "papeterie": "stationery", "carte": "greeting card", "cartes": "greeting card",
+    "animaux": "dog bandana", "chien": "dog bandana", "chat": "cat collar",
+    "cuisine": "ceramic mug", "tasse": "ceramic mug", "mug": "ceramic mug", "assiette": "ceramic plate",
+    "jouet": "wooden toy", "jouets": "wooden toy", "jeu": "wooden toy",
+    "jardin": "garden decor", "fete": "party decor", "gateau": "cake topper",
+    "deco": "home decor", "decoration": "home decor", "murale": "wall decor", "maison": "home decor",
+    "bijou": "necklace", "collier": "necklace", "boucle": "earrings", "bracelet": "bracelet",
+}
+
 def resolve_keyword(kw):
-    """Si l'utilisateur tape un NOM DE NICHE (francais, accents, '&'), on le traduit
-    en mots-cles anglais que Etsy comprend. Sinon (mot-cle anglais deja correct) on le
-    laisse intact. Retourne (keyword_effectif, traduit_bool)."""
+    """Traduit un mot-cle FR (nom de niche OU mot produit) en anglais pour Etsy.
+    1) mots produit FR connus -> EN (rangement->storage basket...). 2) nom de niche
+    complet -> mots-cles EN. Sinon (deja anglais) on laisse intact.
+    Retourne (keyword_effectif, traduit_bool)."""
     raw = (kw or "").strip()
     if not raw:
         return raw, False
     import re as _re
-    norm = lambda s: set(w for w in _re.findall(r"[a-z]+", _strip_accents(s).lower()) if len(w) > 2)
-    kset = norm(raw)
+    words = [w for w in _re.findall(r"[a-z]+", _strip_accents(raw).lower()) if len(w) > 1]
+    kset = set(w for w in words if len(w) > 2)
     if not kset:
         return raw, False
+    # 1) traduction mot-a-mot via dico FR->EN (gere mots isoles type "rangement")
+    hits = [FR_EN_WORD[w] for w in words if w in FR_EN_WORD]
+    if hits:
+        # dedup en gardant l'ordre, prend la 1ere traduction (mot produit principal)
+        seen = []
+        for h in hits:
+            if h not in seen: seen.append(h)
+        return seen[0], True
+    # 2) nom de niche complet -> mots-cles EN (seuil 60% des mots de la niche)
+    norm = lambda s: set(w for w in _re.findall(r"[a-z]+", _strip_accents(s).lower()) if len(w) > 2)
     best, score = None, 0.0
     for niche, eng in NICHE_SEARCH_KW.items():
         nset = norm(niche)
         if not nset:
             continue
-        ov = len(kset & nset) / len(nset)   # part des mots de la niche couverts
+        ov = len(kset & nset) / len(nset)
         if ov > score:
             best, score = eng, ov
-    # seuil: au moins 60% des mots de la niche presents => c'est bien un nom de niche
     if best and score >= 0.6:
         return best, True
     return raw, False
@@ -813,10 +850,10 @@ def _diverse_slice(shops, target):
 def finalize(res, target=0, min_per_niche=1, diversify=True):
     """Etape finale commune a tous les modes.
 
-    Si min_per_niche=n>1 (ex: 5): on ne garde QUE des niches PLEINES de n boutiques.
-    Chaque niche affichee contient EXACTEMENT n boutiques (les n meilleures par
-    ventes/mois). On empile assez de niches pour approcher `target` sans depasser.
-    => fini les niches a 1 boutique.
+    min_per_niche=n>1 (ex: 5) est un MINIMUM, pas un plafond: on ne garde que les
+    niches ayant AU MOINS n boutiques, et on affiche TOUTES leurs boutiques (pas
+    seulement n). `target` plafonne le total: on empile les niches (les meilleures
+    d'abord) tant qu'on ne depasse pas la cible.
 
     Si min_per_niche<=1: round-robin entre niches puis coupe a EXACTEMENT target."""
     shops = res.get("shops", [])
@@ -826,22 +863,26 @@ def finalize(res, target=0, min_per_niche=1, diversify=True):
 
     all_shops = list(shops)
     if n > 1:
-        # groupe par niche, garde niches a >= n, prend les n meilleures par niche
+        # groupe par niche, garde niches a >= n, affiche TOUTES leurs boutiques
         g = {}
         for s in shops:
             g.setdefault(s["_niche"], []).append(s)
         full = []
         for lab, lst in g.items():
-            if len(lst) >= n:
+            if len(lst) >= n:                 # minimum n => la niche est retenue
                 lst.sort(key=lambda x: -x["rate"])
-                full.append((lab, lst[:n], lst[0]["rate"]))
+                full.append((lab, lst, lst[0]["rate"]))
         # meilleures niches d'abord (par ventes/mois de leur tete)
         full.sort(key=lambda t: -t[2])
         out = []
         for lab, lst, _r in full:
-            if target and target > 0 and len(out) + n > target:
-                break                    # ne depasse pas la cible (multiples de n)
-            out.extend(lst)
+            if target and target > 0 and len(out) >= target:
+                break
+            room = (target - len(out)) if (target and target > 0) else None
+            # on prend toute la niche, sauf si ca depasse la cible: on coupe mais on
+            # garde au moins n (sinon la niche violerait le minimum).
+            take = lst if room is None or len(lst) <= room else lst[:max(room, n)]
+            out.extend(take)
         if not out and full:             # target < n : garde au moins 1 niche pleine
             out = full[0][1]
         shops = out
