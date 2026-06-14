@@ -67,12 +67,13 @@ def ai_model_name():
     return ""
 
 def _openrouter_call(prompt, max_tokens, model, key):
-    body = json.dumps({"model": model, "max_tokens": max_tokens,
+    # temperature=0 => deterministe/precis (pas de creativite). top_p=1.
+    body = json.dumps({"model": model, "max_tokens": max_tokens, "temperature": 0, "top_p": 1,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=body,
         headers={"Authorization": "Bearer " + key, "content-type": "application/json",
                  "HTTP-Referer": "https://localhost", "X-Title": "CraftPilot"})
-    r = json.load(urllib.request.urlopen(req, timeout=60))
+    r = json.load(urllib.request.urlopen(req, timeout=90))
     return r["choices"][0]["message"]["content"]
 
 def _ai_call(prompt, max_tokens=2000):
@@ -87,7 +88,7 @@ def _ai_call(prompt, max_tokens=2000):
                     continue
         return ""
     if ANTHROPIC_KEY:
-        body = json.dumps({"model": AI_MODEL, "max_tokens": max_tokens,
+        body = json.dumps({"model": AI_MODEL, "max_tokens": max_tokens, "temperature": 0,
                            "messages": [{"role": "user", "content": prompt}]}).encode()
         req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body,
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
@@ -132,7 +133,7 @@ def _ai_refine_chunk(chunk, query=""):
     fournie, l'IA juge AUSSI la pertinence semantique vs la recherche (ex: 'support'
     = un support/socle, PAS 'emotional support')."""
     taxo = "\n".join("  - " + n for n in NICHE_TAXONOMY)
-    items = [{"id": s["id"], "titres": (s.get("titles") or [s.get("sample", "")])[:20]}
+    items = [{"id": s["id"], "titres": (s.get("titles") or [s.get("sample", "")])[:40]}
              for s in chunk]
     rel_rule = ""
     rel_field = ""
@@ -148,12 +149,18 @@ def _ai_refine_chunk(chunk, query=""):
     prompt = (
         "Tu es un AGENT autonome d'analyse de niches Etsy pour un dropshipper. Tu recois "
         "plusieurs boutiques, chacune avec la LISTE complete de ses titres produits.\n\n"
+        "Prends ton TEMPS. Sois PRECIS et RIGOUREUX. N'invente rien: base-toi uniquement "
+        "sur les titres fournis.\n\n"
         "METHODE OBLIGATOIRE pour CHAQUE boutique:\n"
-        "1. Lis les titres UN PAR UN. Pour chaque titre, identifie mentalement le type de "
-        "produit (ex: 'macrame wall hanging' -> decoration murale ; 'soy candle' -> bougie).\n"
-        "2. Compte combien de titres tombent dans chaque categorie.\n"
-        "3. La niche de la boutique = la categorie MAJORITAIRE (le plus de titres). Ignore "
-        "les titres isoles/exceptions. Une boutique a UNE seule niche dominante.\n"
+        "1. Lis ABSOLUMENT TOUS les titres, UN PAR UN, sans en sauter. Pour chaque titre, "
+        "identifie le type de produit reel (ex: 'macrame wall hanging' -> decoration murale ; "
+        "'soy candle' -> bougie ; 'faux potted plant' -> plante artificielle).\n"
+        "2. Compte precisement combien de titres tombent dans chaque categorie.\n"
+        "3. La niche de la boutique = la categorie STRICTEMENT MAJORITAIRE (le plus de titres). "
+        "Ignore les titres isoles/exceptions. Une boutique a UNE seule niche dominante.\n"
+        "4. Verifie ta conclusion: relis les titres et confirme que ta niche couvre bien la "
+        "majorite avant de repondre. En cas de doute entre deux niches, choisis celle qui "
+        "couvre le plus de titres.\n"
         + rel_rule +
         "\nRenvoie par boutique:\n"
         "- accept (bool): true SEULEMENT si la majorite des produits sont PHYSIQUES, NON "
@@ -183,7 +190,7 @@ def _ai_refine_chunk(chunk, query=""):
             pass
     return out
 
-def ai_refine(shops, batch=20, query=""):
+def ai_refine(shops, batch=8, query=""):
     """Cerveau du logiciel. Decoupe en lots et les traite EN PARALLELE (gros gain
     vitesse, le failover de cles reste gere par lot). Par boutique:
       - accept: vrai produit physique vendable (pas perso/digital/vetement/bijou/gadget/lourd).
