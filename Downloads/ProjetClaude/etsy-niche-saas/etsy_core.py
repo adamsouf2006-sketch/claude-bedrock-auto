@@ -319,6 +319,24 @@ def keyword_relevance(titles, kw_en):
     n = sum(1 for t in low if any(w in t for w in strong))
     return n / len(low)
 
+def _strong_tokens(kw_en):
+    import re as _re
+    toks = [w for w in _re.findall(r"[a-z]+", (kw_en or "").lower()) if len(w) > 2]
+    return [w for w in toks if w not in _REL_GENERIC] or toks
+
+def match_sample(titles, kw_en):
+    """Renvoie un titre du catalogue qui contient le mot-cle cherche (pour l'affichage
+    colonne Produit). A defaut, le 1er titre."""
+    if not titles:
+        return ""
+    strong = _strong_tokens(kw_en)
+    if strong:
+        for t in titles:
+            tl = t.lower()
+            if any(w in tl for w in strong):
+                return t
+    return titles[0]
+
 def snap_niche(name):
     """Force une niche IA dans la taxonomie fixe (tolerant aux variantes). Retourne
     toujours une valeur de NICHE_TAXONOMY => regroupement garanti."""
@@ -1003,6 +1021,8 @@ def search_cache(filters=None, keyword=""):
         if rec["months"] < f.get("min_age_months", 0): continue
         if rec["sold"] < f.get("min_sold", 0): continue
         if f.get("exclude_digital", True) and rec.get("digital_pct", 0) >= 50: continue
+        if kw_en:                          # affiche un produit qui matche le mot-cle
+            rec = dict(rec); rec["sample"] = match_sample(titles, kw_en)
         shops.append(rec)
     shops.sort(key=lambda x: -x["rate"])   # best-sellers d'abord (ventes/mois)
     total = len(shops)
@@ -1283,6 +1303,8 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         for rec in keep_recs:
             if kw_rel and keyword_relevance(shop_titles(rec), kw_rel) < rel_min:
                 continue
+            if kw_rel:                     # affiche un produit qui matche le mot-cle
+                rec = dict(rec); rec["sample"] = match_sample(shop_titles(rec), kw_rel)
             shops.append(rec)
             if progress: progress(len(shops), seen_listings)
             if len(shops) >= target_count: break
