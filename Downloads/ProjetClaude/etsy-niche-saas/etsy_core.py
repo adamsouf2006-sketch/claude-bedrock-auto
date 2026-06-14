@@ -868,13 +868,16 @@ def _ensure_labels(shops):
         if not r.get("ali_url"):
             r["ali_url"] = aliexpress_url(r.get("sample", ""))
 
+CATCHALL = "Autre deco maison"   # niche fourre-tout: toujours reléguée en dernier
+
 def cluster(shops):
     _ensure_labels(shops)
     g = {}
     for r in shops:
         g.setdefault(r["_niche"], []).append(r)
     out = [{"niche": n, "count": len(l), "shops": sorted(l, key=lambda x: -x["rate"])} for n, l in g.items()]
-    out.sort(key=lambda x: -x["count"]); return out
+    # vraies niches d'abord (par taille), le fourre-tout 'Autre deco maison' en dernier
+    out.sort(key=lambda x: (x["niche"] == CATCHALL, -x["count"])); return out
 
 def _diverse_slice(shops, target):
     """Coupe a EXACTEMENT `target` boutiques en round-robin entre niches: evite que
@@ -885,6 +888,8 @@ def _diverse_slice(shops, target):
     buckets = OrderedDict()
     for s in shops:
         buckets.setdefault(s.get("_niche", "?"), []).append(s)
+    if CATCHALL in buckets:                 # fourre-tout pioche en dernier
+        buckets.move_to_end(CATCHALL)
     out = []
     while len(out) < target and any(buckets.values()):
         for lab in list(buckets.keys()):
@@ -919,17 +924,30 @@ def finalize(res, target=0, min_per_niche=1, diversify=True):
             if len(lst) >= n:                 # minimum n => la niche est retenue
                 lst.sort(key=lambda x: -x["rate"])
                 full.append((lab, lst, lst[0]["rate"]))
-        # meilleures niches d'abord (par ventes/mois de leur tete)
-        full.sort(key=lambda t: -t[2])
+        # vraies niches d'abord (par ventes/mois de leur tete), fourre-tout en dernier
+        full.sort(key=lambda t: (t[0] == CATCHALL, -t[2]))
+        # VARIETE + minimum: chaque niche retenue recoit d'abord ses n meilleures
+        # (garantit le minimum), puis on distribue le reste en round-robin entre niches
+        # jusqu'a la cible => plusieurs niches affichees, pas une seule qui monopolise.
+        if target and target > 0:
+            max_niches = max(1, target // n)          # nb de niches qui tiennent dans la cible
+            chosen = full[:max_niches]
+        else:
+            chosen = full
+        from collections import deque
+        queues = [(lab, deque(lst)) for lab, lst, _r in chosen]
         out = []
-        for lab, lst, _r in full:
-            if target and target > 0 and len(out) >= target:
-                break
-            room = (target - len(out)) if (target and target > 0) else None
-            # on prend toute la niche, sauf si ca depasse la cible: on coupe mais on
-            # garde au moins n (sinon la niche violerait le minimum).
-            take = lst if room is None or len(lst) <= room else lst[:max(room, n)]
-            out.extend(take)
+        # passe 1: minimum n par niche
+        for lab, q in queues:
+            for _ in range(min(n, len(q))):
+                out.append(q.popleft())
+        # passe 2: round-robin du reste jusqu'a la cible
+        while (not target or target <= 0 or len(out) < target) and any(q for _, q in queues):
+            for lab, q in queues:
+                if q:
+                    out.append(q.popleft())
+                    if target and target > 0 and len(out) >= target:
+                        break
         if not out and full:             # target < n : garde au moins 1 niche pleine
             out = full[0][1]
         shops = out
