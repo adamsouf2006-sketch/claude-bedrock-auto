@@ -173,6 +173,9 @@ def _ai_refine_chunk(chunk, query=""):
         "'Paniers en osier'). \n"
         "   * ni trop large (PAS 'Decoration maison', 'Artisanat') ni trop precis (PAS "
         "'Bouquet de roses rouges en soie 5 tiges').\n"
+        "   * REGROUPE les sous-types proches sous UN meme nom: fleurs + plantes + arbres "
+        "artificiels => 'Fleurs & plantes artificielles' (PAS 3 niches separees). Idem "
+        "interieur/exterieur = meme niche.\n"
         "   * nomme par le PRODUIT, jamais par un theme/occasion/style.\n"
         "- dropship (float 0..1): proba que ces produits soient INDUSTRIELS revendus, "
         "trouvables A L'IDENTIQUE sur AliExpress/Alibaba. 0.8-1 = generique mass-produit "
@@ -343,20 +346,37 @@ def match_sample(titles, kw_en):
 # Normalisation des noms de niche LIBRES generes par l'IA: deux libelles equivalents
 # ("Fleurs artificielles" / "Fausses fleurs & plantes") doivent retomber sur la MEME
 # cle de regroupement, sinon chaque boutique fait sa propre niche.
-_NICHE_SYN = {  # synonymes -> forme canonique
+_NICHE_SYN = {  # synonymes -> forme canonique (familles de produits regroupees largement)
     "faux": "artificiel", "fausse": "artificiel", "fausses": "artificiel",
     "fake": "artificiel", "artificielle": "artificiel", "artificielles": "artificiel",
-    "synthetique": "artificiel", "soie": "artificiel",
-    "fleur": "fleur", "fleurs": "fleur", "floral": "fleur", "florale": "fleur",
-    "plante": "plante", "plantes": "plante", "plant": "plante",
-    "bougie": "bougie", "bougies": "bougie", "candle": "bougie",
-    "panier": "panier", "paniers": "panier", "basket": "panier",
-    "tenture": "tenture", "tentures": "tenture", "macrame": "macrame",
-    "coussin": "coussin", "coussins": "coussin", "vase": "vase", "vases": "vase",
-    "tapis": "tapis", "sac": "sac", "sacs": "sac", "bougeoir": "bougeoir",
+    "artificiels": "artificiel", "synthetique": "artificiel", "soie": "artificiel",
+    # famille vegetale -> 'plante' (fleurs, plantes, arbres, feuillages... = meme niche large)
+    "fleur": "plante", "fleurs": "plante", "floral": "plante", "florale": "plante",
+    "plante": "plante", "plantes": "plante", "plant": "plante", "arbre": "plante",
+    "arbres": "plante", "tree": "plante", "feuillage": "plante", "eucalyptus": "plante",
+    "succulente": "plante", "succulentes": "plante", "bouquet": "plante", "tige": "plante",
+    "tiges": "plante", "pampa": "plante", "pampas": "plante", "branche": "plante",
+    # bougies
+    "bougie": "bougie", "bougies": "bougie", "candle": "bougie", "bougeoir": "bougie",
+    "senteur": "bougie", "parfumee": "bougie",
+    # paniers / rangement tresse
+    "panier": "panier", "paniers": "panier", "basket": "panier", "osier": "panier",
+    "rotin": "panier", "rangement": "panier",
+    # textile
+    "coussin": "coussin", "coussins": "coussin", "housse": "coussin",
+    "tapis": "tapis", "paillasson": "tapis",
+    # ceramique
+    "vase": "vase", "vases": "vase", "ceramique": "vase", "poterie": "vase",
+    # murale
+    "tenture": "tenture", "tentures": "tenture", "macrame": "tenture",
+    "suncatcher": "tenture", "miroir": "tenture",
+    "sac": "sac", "sacs": "sac",
 }
 _NICHE_FILLER = {"deco", "decoration", "decorative", "maison", "home", "interieur",
+                 "exterieur", "exterieure", "exterieurs", "exterieures", "indoor", "outdoor",
                  "art", "style", "moderne", "boho", "pour", "avec", "set", "collection",
+                 "grand", "grande", "petit", "petite", "mini", "large", "long", "longue",
+                 "soja", "soy", "cire", "wax", "naturel", "naturelle", "fait", "main",
                  "the", "and", "les", "des", "une", "produit", "produits"}
 
 def niche_canon(name):
@@ -367,7 +387,15 @@ def niche_canon(name):
     for w in _re.findall(r"[a-z]+", _strip_accents((name or "").lower())):
         if len(w) <= 2 or w in _NICHE_FILLER:
             continue
-        toks.append(_NICHE_SYN.get(w, w.rstrip("s") if len(w) > 4 else w))
+        # synonyme direct, sinon on singularise PUIS on retente le synonyme
+        if w in _NICHE_SYN:
+            w = _NICHE_SYN[w]
+        else:
+            sg = w[:-1] if (len(w) > 4 and w.endswith("s")) else w
+            w = _NICHE_SYN.get(sg, sg)
+        if w in _NICHE_FILLER:
+            continue
+        toks.append(w)
     return " ".join(sorted(set(toks)))
 
 def snap_niche(name):
