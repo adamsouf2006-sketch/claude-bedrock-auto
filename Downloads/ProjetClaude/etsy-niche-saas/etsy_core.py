@@ -132,7 +132,6 @@ def _ai_refine_chunk(chunk, query=""):
     en examinant ses titres UN PAR UN puis decide la niche majoritaire. Si `query`
     fournie, l'IA juge AUSSI la pertinence semantique vs la recherche (ex: 'support'
     = un support/socle, PAS 'emotional support')."""
-    taxo = "\n".join("  - " + n for n in NICHE_TAXONOMY)
     items = [{"id": s["id"], "titres": (s.get("titles") or [s.get("sample", "")])[:40]}
              for s in chunk]
     rel_rule = ""
@@ -153,24 +152,28 @@ def _ai_refine_chunk(chunk, query=""):
         "sur les titres fournis.\n\n"
         "METHODE OBLIGATOIRE pour CHAQUE boutique:\n"
         "1. Lis ABSOLUMENT TOUS les titres, UN PAR UN, sans en sauter. Pour chaque titre, "
-        "identifie le type de produit reel (ex: 'macrame wall hanging' -> decoration murale ; "
-        "'soy candle' -> bougie ; 'faux potted plant' -> plante artificielle).\n"
-        "2. Compte precisement combien de titres tombent dans chaque categorie.\n"
-        "3. La niche de la boutique = la categorie STRICTEMENT MAJORITAIRE (le plus de titres). "
-        "Ignore les titres isoles/exceptions. Une boutique a UNE seule niche dominante.\n"
+        "identifie le type de produit reel (ex: 'macrame wall hanging' -> tenture murale ; "
+        "'soy candle' -> bougie parfumee ; 'faux potted plant' -> plante artificielle).\n"
+        "2. Compte precisement combien de titres tombent dans chaque type de produit.\n"
+        "3. La niche de la boutique = le type de produit STRICTEMENT MAJORITAIRE (le plus de "
+        "titres). Ignore les titres isoles/exceptions. Une boutique a UNE seule niche dominante.\n"
         "4. Verifie ta conclusion: relis les titres et confirme que ta niche couvre bien la "
-        "majorite avant de repondre. En cas de doute entre deux niches, choisis celle qui "
-        "couvre le plus de titres.\n"
+        "majorite avant de repondre. En cas de doute, choisis le type qui couvre le plus de titres.\n"
         + rel_rule +
         "\nRenvoie par boutique:\n"
         "- accept (bool): true SEULEMENT si la majorite des produits sont PHYSIQUES, NON "
         "personnalises, non digitaux, sans vetement/bijou/sticker/porte-cles/electronique/"
         "gadget, pas trop lourds, sans croyance/occulte. Sinon false.\n"
         + ("- match (bool): true si la boutique vend bien le produit cherche (voir PERTINENCE). Sinon false.\n" if query else "") +
-        "- niche (str): EXACTEMENT une valeur de cette liste fermee (recopie telle quelle), "
-        "celle qui correspond a la MAJORITE des titres. Jamais inventer, jamais un nom de "
-        "produit. Liste autorisee:\n" + taxo + "\n"
-        "Si vraiment rien ne domine, mets 'Autre deco maison'.\n"
+        "- niche (str): TU DEDUIS LIBREMENT le nom de la niche a partir des titres (pas de liste "
+        "imposee). REGLES STRICTES pour ce nom:\n"
+        "   * en francais, 2 a 4 mots, decrivant la CATEGORIE de produit (pas un produit precis).\n"
+        "   * assez GENERIQUE pour que d'autres boutiques du meme type tombent dans la MEME niche "
+        "(ex BON: 'Fleurs artificielles', 'Bougies parfumees', 'Tentures murales macrame', "
+        "'Paniers en osier'). \n"
+        "   * ni trop large (PAS 'Decoration maison', 'Artisanat') ni trop precis (PAS "
+        "'Bouquet de roses rouges en soie 5 tiges').\n"
+        "   * nomme par le PRODUIT, jamais par un theme/occasion/style.\n"
         "- dropship (float 0..1): proba que ces produits soient INDUSTRIELS revendus, "
         "trouvables A L'IDENTIQUE sur AliExpress/Alibaba. 0.8-1 = generique mass-produit "
         "(led, gadget, deco usine, print-on-demand). 0-0.2 = vrai artisanat unique fait main.\n"
@@ -337,6 +340,36 @@ def match_sample(titles, kw_en):
                 return t
     return titles[0]
 
+# Normalisation des noms de niche LIBRES generes par l'IA: deux libelles equivalents
+# ("Fleurs artificielles" / "Fausses fleurs & plantes") doivent retomber sur la MEME
+# cle de regroupement, sinon chaque boutique fait sa propre niche.
+_NICHE_SYN = {  # synonymes -> forme canonique
+    "faux": "artificiel", "fausse": "artificiel", "fausses": "artificiel",
+    "fake": "artificiel", "artificielle": "artificiel", "artificielles": "artificiel",
+    "synthetique": "artificiel", "soie": "artificiel",
+    "fleur": "fleur", "fleurs": "fleur", "floral": "fleur", "florale": "fleur",
+    "plante": "plante", "plantes": "plante", "plant": "plante",
+    "bougie": "bougie", "bougies": "bougie", "candle": "bougie",
+    "panier": "panier", "paniers": "panier", "basket": "panier",
+    "tenture": "tenture", "tentures": "tenture", "macrame": "macrame",
+    "coussin": "coussin", "coussins": "coussin", "vase": "vase", "vases": "vase",
+    "tapis": "tapis", "sac": "sac", "sacs": "sac", "bougeoir": "bougeoir",
+}
+_NICHE_FILLER = {"deco", "decoration", "decorative", "maison", "home", "interieur",
+                 "art", "style", "moderne", "boho", "pour", "avec", "set", "collection",
+                 "the", "and", "les", "des", "une", "produit", "produits"}
+
+def niche_canon(name):
+    """Cle de regroupement stable pour un nom de niche libre. Accents/pluriels/synonymes
+    normalises, mots vides retires, tokens tries. '' si vide."""
+    import re as _re
+    toks = []
+    for w in _re.findall(r"[a-z]+", _strip_accents((name or "").lower())):
+        if len(w) <= 2 or w in _NICHE_FILLER:
+            continue
+        toks.append(_NICHE_SYN.get(w, w.rstrip("s") if len(w) > 4 else w))
+    return " ".join(sorted(set(toks)))
+
 def snap_niche(name):
     """Force une niche IA dans la taxonomie fixe (tolerant aux variantes). Retourne
     toujours une valeur de NICHE_TAXONOMY => regroupement garanti."""
@@ -374,6 +407,9 @@ def ai_enrich_shops(shops, f):
     thr = float(f.get("dropship_min", 0.5))
     gate_ds = bool(f.get("ai_dropship_gate"))
     kept = []
+    # 1er passage: applique verdict + collecte les libelles libres par cle de regroupement
+    canon_labels = {}                      # canon -> Counter(libelles bruts)
+    from collections import Counter
     for s in shops:
         v = verdict.get(s["id"])
         if v is None:
@@ -382,17 +418,25 @@ def ai_enrich_shops(shops, f):
             continue                            # IA rejette: hors cible
         if query and v.get("match") is False:
             continue                            # IA: boutique hors-sujet vs la recherche
-        niche = snap_niche(v.get("niche"))   # force dans la taxonomie => vrai regroupement
-        s["ai_niche"] = niche
-        s["_niche"] = niche
+        raw = (str(v.get("niche") or "")).strip() or "Divers"
+        key = niche_canon(raw) or raw.lower()
+        canon_labels.setdefault(key, Counter())[raw] += 1
+        s["_niche_key"] = key; s["ai_niche_raw"] = raw
         if "dropship" in v:
             try: s["ai_dropship"] = round(float(v["dropship"]), 2)
             except Exception: pass
         if v.get("reason"):
-            s["ai_reason"] = v["reason"]
+            s["ai_reason"] = str(v["reason"])
         if gate_ds and s.get("ai_dropship") is not None and s["ai_dropship"] < thr:
             continue                            # produit trop unique => pas dropship-able
         kept.append(s)
+    # libelle d'affichage par cle = le plus frequent (a egalite, le plus court)
+    display = {k: sorted(cnt.items(), key=lambda kv: (-kv[1], len(kv[0])))[0][0]
+               for k, cnt in canon_labels.items()}
+    for s in kept:
+        k = s.get("_niche_key")
+        if k:                                  # variantes equivalentes => meme niche affichee
+            s["ai_niche"] = display[k]; s["_niche"] = display[k]
     return kept, True
 
 # Cle API Etsy: env ETSY_API_KEY ou config.local.json (jamais en dur / jamais commitee).
@@ -879,7 +923,7 @@ def _ensure_labels(shops):
     for r in shops:
         if not r.get("_niche"):
             if r.get("ai_niche"):
-                r["_niche"] = snap_niche(r["ai_niche"])   # garanti dans la taxonomie
+                r["_niche"] = r["ai_niche"]   # niche LIBRE deduite par l'IA (deja normalisee)
             else:
                 lab, conf = niche_of(shop_titles(r))
                 r["_niche"] = lab; r["niche_conf"] = conf
