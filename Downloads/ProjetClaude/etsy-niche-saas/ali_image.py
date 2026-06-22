@@ -110,6 +110,13 @@ _STEALTH_JS = r"""
 # puis retombe sur le TEXTE si l'upload est bloque. Override via env ALI_TRY_IMAGE=0.
 import os as _os
 TRY_IMAGE = _os.environ.get("ALI_TRY_IMAGE", "1") not in ("0", "false", "no")
+# PROFIL PERSISTANT (anti-captcha gratuit): une session Google CONNECTEE se fait challenger
+# bien moins qu'une session anonyme. On stocke les cookies/login dans un user_data_dir reutilise
+# d'un run a l'autre. Login manuel une seule fois via ali_login.py. Defaut: cache/ali_profile.
+# Vide ("") => profil temporaire (comportement anonyme d'avant). Override ALI_PROFILE_DIR.
+_PROFILE_DIR = _os.environ.get(
+    "ALI_PROFILE_DIR",
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "cache", "ali_profile"))
 # Yandex = 2e moteur reverse-image (gratuit, par URL). DESACTIVE par defaut: en pratique il
 # remonte surtout des agregateurs (imall.com) avec des produits DIFFERENTS => faux positifs,
 # 0 gain reel sur AliExpress + cout temps. Override ALI_YANDEX=1 pour le reactiver.
@@ -883,6 +890,14 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
         kw = dict(headless=headless, max_pages=max(1, min(conc, len(prods))), network_idle=False,
                   block_webrtc=True, hide_canvas=True,
                   useragent=_pick_ua(), disable_resources=False)
+        # PROFIL PERSISTANT: reutilise les cookies (login Google) => moins de captcha Lens.
+        if _PROFILE_DIR:
+            try: _os.makedirs(_PROFILE_DIR, exist_ok=True)
+            except Exception: pass
+            kw["user_data_dir"] = _PROFILE_DIR
+            # un profil connecte ne doit PAS changer d'UA a chaque run (incoherence detectee
+            # par Google) => UA fixe quand on a un profil persistant.
+            kw["useragent"] = _UA_POOL[0]
         if proxy_raw: kw["proxy"] = proxy_raw
         sess = AsyncStealthySession(**kw)
         await sess.start()
