@@ -117,6 +117,51 @@ TRY_IMAGE = _os.environ.get("ALI_TRY_IMAGE", "1") not in ("0", "false", "no")
 _PROFILE_DIR = _os.environ.get(
     "ALI_PROFILE_DIR",
     _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "cache", "ali_profile"))
+# COOKIES IMPORTES: Google bloque le login DANS un navigateur automatise ("navigateur pas
+# securise"). Contournement: exporter les cookies google.com depuis ton navigateur normal
+# (extension Cookie-Editor -> Export JSON) vers cache/ali_cookies.json. On les injecte dans
+# le contexte => session deja connectee, pas de page login => Lens challenge moins.
+_COOKIES_FILE = _os.environ.get(
+    "ALI_COOKIES",
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "cache", "ali_cookies.json"))
+_cookies_loaded = False
+def _load_cookies_list():
+    """Lit cache/ali_cookies.json (format Cookie-Editor) -> liste cookies playwright, ou []."""
+    import json
+    try:
+        with open(_COOKIES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return []
+    _smap = {"no_restriction": "None", "unspecified": "Lax", "lax": "Lax",
+             "strict": "Strict", "none": "None"}
+    out = []
+    for c in (raw if isinstance(raw, list) else raw.get("cookies", [])):
+        try:
+            ck = {"name": c["name"], "value": c["value"],
+                  "domain": c.get("domain") or ".google.com", "path": c.get("path", "/")}
+            if c.get("expirationDate"): ck["expires"] = int(c["expirationDate"])
+            if "httpOnly" in c: ck["httpOnly"] = bool(c["httpOnly"])
+            if "secure" in c: ck["secure"] = bool(c["secure"])
+            ss = (c.get("sameSite") or "").lower()
+            if ss in _smap: ck["sameSite"] = _smap[ss]
+            out.append(ck)
+        except Exception:
+            pass
+    return out
+async def _inject_cookies_once(page):
+    """Injecte les cookies importes dans le contexte (1x par process). No-op si pas de fichier."""
+    global _cookies_loaded
+    if _cookies_loaded:
+        return
+    _cookies_loaded = True
+    cks = _load_cookies_list()
+    if not cks:
+        return
+    try:
+        await page.context.add_cookies(cks)
+    except Exception:
+        pass
 # Yandex = 2e moteur reverse-image (gratuit, par URL). DESACTIVE par defaut: en pratique il
 # remonte surtout des agregateurs (imall.com) avec des produits DIFFERENTS => faux positifs,
 # 0 gain reel sur AliExpress + cout temps. Override ALI_YANDEX=1 pour le reactiver.
@@ -909,7 +954,9 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
             async with sem:
                 holder = {"r": (False, "erreur", {})}
                 async def act(page):
-                    try: holder["r"] = await _check_lens(page, prod)
+                    try:
+                        await _inject_cookies_once(page)
+                        holder["r"] = await _check_lens(page, prod)
                     except Exception: holder["r"] = (False, "erreur", {})
                     return page
                 try:
@@ -943,6 +990,7 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
             async with sem:
                 pg = await ctx.new_page()
                 try:
+                    await _inject_cookies_once(pg)
                     return prod, await _check_lens(pg, prod)
                 except Exception:
                     return prod, (False, "erreur", {})
