@@ -925,10 +925,25 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
     # ali_chrome.py), on s'y CONNECTE => session Google deja connectee (DBSC valide car MEME
     # appareil) => Lens repond sans captcha ni mur login. Prioritaire s'il est configure.
     cdp_url = _os3.environ.get("ALI_CDP_URL", "").strip()
-    engine = _os3.environ.get("ALI_ENGINE", "cdp" if cdp_url else
-                              ("scrapling" if SCRAPLING_OK else "patchright")).lower()
-    if engine == "cdp" and not cdp_url:
-        cdp_url = "http://localhost:9222"
+    # MOTEUR PAR DEFAUT = cdp (voie prouvee: vrai Chrome connecte, pas de captcha/Datadome).
+    # Override ALI_ENGINE=scrapling|patchright. ALI_CDP_AUTO=0 desactive l'auto-lancement Chrome.
+    engine = _os3.environ.get("ALI_ENGINE", "cdp").lower()
+    if engine == "cdp":
+        if not cdp_url:
+            cdp_url = "http://localhost:9222"
+        # AUTO-LANCEMENT: le serveur n'a aucune manip a faire. On garantit un Chrome debug
+        # joignable (le lance si besoin, reutilise le profil dedie deja connecte a Google).
+        if _os3.environ.get("ALI_CDP_AUTO", "1") not in ("0", "false", "no"):
+            try:
+                import ali_chrome
+                url = await asyncio.to_thread(ali_chrome.ensure_chrome)
+                if url:
+                    cdp_url = url
+                elif SCRAPLING_OK:           # Chrome indispo => repli automatique
+                    engine = "scrapling"
+            except Exception:
+                if SCRAPLING_OK:
+                    engine = "scrapling"
     if engine == "scrapling" and not SCRAPLING_OK:
         engine = "patchright"
 

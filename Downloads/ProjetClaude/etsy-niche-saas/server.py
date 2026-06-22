@@ -31,11 +31,82 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, (ROOT / "static" / "index.html").read_bytes(), "text/html; charset=utf-8")
         if u.path == "/api/quota":
             return self._send(200, json.dumps(core.quota_state()))
+        if u.path == "/api/stop":
+            sid = parse_qs(u.query).get("sid", [""])[0]
+            ok = core.cancel_search(sid) if sid else False
+            return self._send(200, json.dumps({"stopped": ok}))
         if u.path == "/api/complete_catalogs":
             q = parse_qs(u.query)
             try: lim = min(int(q.get("limit", ["50"])[0]), 300)
             except: lim = 50
             return self._send(200, json.dumps(core.complete_catalogs(lim)))
+        if u.path in ("/api/similar", "/api/similar_stream"):
+            q = parse_qs(u.query)
+            def gi2(k, d):
+                try: return int(q.get(k, [d])[0])
+                except: return d
+            def gb2(k):
+                return q.get(k, ["false"])[0].lower() in ("1", "true", "yes", "on")
+            cats = q.get("exclude_categories", [""])[0]
+            sf = {
+                "min_rate": gi2("min_rate", 0),
+                "max_age_months": gi2("max_age_months", 999),
+                "min_age_months": gi2("min_age_months", 0),
+                "min_sold": gi2("min_sold", 0),
+                "min_price": gi2("min_price", 0),
+                "max_weight_g": gi2("max_weight_g", 0),
+                "exclude_digital": gb2("exclude_digital"),
+                "exclude_perso": gb2("exclude_perso"),
+                "exclude_supply": gb2("exclude_supply"),
+                "exclude_vintage": gb2("exclude_vintage"),
+                "exclude_heavy": gb2("exclude_heavy"),
+                "exclude_custom_shops": gb2("exclude_custom_shops"),
+                "exclude_categories": [c for c in cats.split(",") if c],
+                "use_ai": gb2("use_ai"),
+                "validate_ali": gb2("validate_ali"),
+                "ali_products": gi2("ali_products", 5),
+                "ali_min_match": gi2("ali_min_match", 2),
+                "ali_gate": gb2("ali_gate"),
+                "fetch_titles": True,
+                "only_cn_hk": gb2("only_cn_hk"),
+                "min_per_niche": gi2("min_per_niche", 1),
+            }
+            shop = q.get("shop", [""])[0]
+            smode = q.get("mode", ["live"])[0]
+            target = gi2("target_count", 30)
+            mxa = gi2("max_api", 0) or (target * 6 + 200)
+            if u.path == "/api/similar_stream":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                def sse2(obj):
+                    try:
+                        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                def prog2(matched, scanned):
+                    sse2({"type": "progress", "matched": matched, "scanned": scanned})
+                sid = q.get("sid", [""])[0]
+                ev = core.make_cancel(sid) if sid else None
+                try:
+                    res = core.find_similar_shops(shop_input=shop, target_count=min(target, 300),
+                                                  max_api=mxa, filters=sf, mode=smode,
+                                                  progress=prog2, stop=ev)
+                    sse2({"type": "done", "result": res})
+                except Exception as e:
+                    sse2({"type": "error", "error": str(e)})
+                finally:
+                    if sid: core.clear_cancel(sid)
+                return
+            try:
+                res = core.find_similar_shops(shop_input=shop, target_count=min(target, 300),
+                                              max_api=mxa, filters=sf, mode=smode)
+                return self._send(200, json.dumps(res, ensure_ascii=False))
+            except Exception as e:
+                return self._send(500, json.dumps({"error": str(e)}))
         if u.path in ("/api/discover", "/api/export", "/api/discover_stream"):
             q = parse_qs(u.query)
             def gi(k, d):  # get int
@@ -64,10 +135,11 @@ class H(BaseHTTPRequestHandler):
                 "target_count": gi("target_count", 100),
                 "min_per_niche": gi("min_per_niche", 1),
                 "validate_ali": gb("validate_ali"),
-                "ali_products": gi("ali_products", 10),
-                "ali_min_match": gi("ali_min_match", 3),
+                "ali_products": gi("ali_products", 5),
+                "ali_min_match": gi("ali_min_match", 2),
                 "ali_gate": gb("ali_gate"),
                 "fetch_titles": gb("fetch_titles"),
+                "only_cn_hk": gb("only_cn_hk"),
             }
             target = gi("target_count", 100)
             keyword = q.get("keyword", [""])[0]
@@ -88,18 +160,29 @@ class H(BaseHTTPRequestHandler):
                         pass
                 def prog(matched, scanned):
                     sse({"type": "progress", "matched": matched, "scanned": scanned})
+                sid = q.get("sid", [""])[0]
+                ev = core.make_cancel(sid) if sid else None
                 try:
                     if source == "scrape":
                         res = core.run_scrape(keyword=keyword, target_count=min(target, 1000),
-                                              filters=filters, progress=prog)
+                                              filters=filters, progress=prog, stop=ev)
                     elif source == "live":
-                        res = core.run_discovery(keyword=keyword, target_count=min(target, 500),
-                                                 max_api=gi("max_api", 500), filters=filters, progress=prog)
+                        tgt = min(target, 1000)
+                        # budget credits auto-dimensionne sur la cible (~3 credits/boutique:
+                        # 1 enrich + 1 titres + part de listing). Sinon le budget fixe 500
+                        # arretait la recherche avant d'atteindre la cible demandee.
+                        # budget genereux: le sur-echantillonnage (IA/AliExpress filtrent
+                        # apres) demande de scanner plus de candidats pour NET >= cible.
+                        mxa = gi("max_api", 0) or (tgt * 6 + 100)
+                        res = core.run_discovery(keyword=keyword, target_count=tgt,
+                                                 max_api=mxa, filters=filters, progress=prog, stop=ev)
                     else:
                         res = core.search_cache(filters=filters, keyword=keyword)
                     sse({"type": "done", "result": res})
                 except Exception as e:
                     sse({"type": "error", "error": str(e)})
+                finally:
+                    if sid: core.clear_cancel(sid)
                 return
 
             if u.path == "/api/export":
@@ -117,15 +200,41 @@ class H(BaseHTTPRequestHandler):
                 elif source == "scrape":
                     res = core.run_scrape(keyword=keyword, target_count=min(target, 1000), filters=filters)
                 else:
-                    res = core.run_discovery(keyword=keyword, target_count=min(target, 500),
-                                             max_api=gi("max_api", 500), filters=filters)
+                    tgt = min(target, 1000)
+                    mxa = gi("max_api", 0) or (tgt * 6 + 100)
+                    res = core.run_discovery(keyword=keyword, target_count=tgt,
+                                             max_api=mxa, filters=filters)
                 return self._send(200, json.dumps(res, ensure_ascii=False))
             except Exception as e:
                 return self._send(500, json.dumps({"error": str(e)}))
         return self._send(404, json.dumps({"error": "not found"}))
 
 
+def _ensure_dropship_chrome():
+    """Lance le Chrome debug (CDP) de la detection dropship des le demarrage => aucune commande
+    a taper. 1er run: la fenetre s'ouvre sur lens.google.com pour le login Google (1 seule fois).
+    Desactivable via ALI_CDP_AUTO=0."""
+    import os
+    if os.environ.get("ALI_CDP_AUTO", "1") in ("0", "false", "no"):
+        return
+    try:
+        import ali_chrome
+        first = ali_chrome.first_login_needed()
+        url = ali_chrome.ensure_chrome()
+        if url:
+            os.environ["ALI_CDP_URL"] = url
+            print(f"Detection dropship: Chrome debug pret ({url}).")
+            if first:
+                print(">>> 1re fois: CONNECTE-TOI a Google dans la fenetre Chrome qui s'ouvre,")
+                print(">>> verifie lens.google.com sans captcha. Ensuite c'est automatique.")
+        else:
+            print("Detection dropship: Chrome debug indispo (repli moteur furtif).")
+    except Exception as e:
+        print("Detection dropship: init Chrome ignoree:", repr(e)[:80])
+
+
 if __name__ == "__main__":
     print(f"SaaS niche Etsy -> http://localhost:{PORT}")
+    _ensure_dropship_chrome()
     print("Ctrl+C pour arreter.")
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
