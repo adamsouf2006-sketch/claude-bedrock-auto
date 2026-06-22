@@ -39,14 +39,27 @@ def debug_ok(port=PORT):
     except Exception:
         return None
 
-def launch(port=PORT, profile=PROFILE, url="https://lens.google.com/"):
-    """Lance le Chrome debug (non bloquant). Retourne True si le process a ete lance."""
+def launch(port=PORT, profile=PROFILE, url="https://lens.google.com/", hidden=False):
+    """Lance le Chrome debug (non bloquant). hidden=True => fenetre HORS-ECRAN (invisible mais
+    fonctionnelle: DBSC/Lens marchent car c'est un vrai Chrome, pas du headless). Retourne True
+    si le process a ete lance."""
     exe = chrome_exe()
     if not exe:
         return False
     os.makedirs(profile, exist_ok=True)
     args = [exe, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-            "--no-first-run", "--no-default-browser-check", "--new-window", url]
+            "--no-first-run", "--no-default-browser-check", "--new-window"]
+    if hidden:
+        # pousse la fenetre tres loin hors de l'ecran + petite taille => l'utilisateur ne la
+        # voit pas. On NE met PAS --headless (Google challenge le headless; un Chrome reel
+        # hors-ecran garde la session connectee et passe Lens).
+        # ANTI-THROTTLING: une fenetre hors-ecran/arriere-plan est ralentie par Chrome (timers
+        # JS brides) => Lens lazy-load trop lent => hits rates. Ces flags gardent le plein regime.
+        args += ["--window-position=-32000,-32000", "--window-size=1100,850",
+                 "--disable-background-timer-throttling",
+                 "--disable-backgrounding-occluded-windows",
+                 "--disable-renderer-backgrounding"]
+    args.append(url)
     try:
         subprocess.Popen(args, close_fds=True)
         return True
@@ -56,11 +69,12 @@ def launch(port=PORT, profile=PROFILE, url="https://lens.google.com/"):
 def ensure_chrome(port=PORT, profile=PROFILE, wait=18):
     """Garantit un Chrome debug joignable. Le lance si besoin et attend le port.
     Retourne l'URL CDP ('http://localhost:PORT') ou None si echec.
-    NON-INTERACTIF: si c'est le 1er run sans login, Lens captcha encore -> a l'utilisateur
-    de se connecter une fois (la fenetre s'ouvre sur lens.google.com)."""
+    INVISIBLE par defaut: la fenetre est lancee HORS-ECRAN, SAUF au 1er run (login Google a
+    faire => visible). Une fois le profil connecte, tout tourne en arriere-plan."""
     if debug_ok(port):
         return f"http://localhost:{port}"
-    if not launch(port, profile):
+    hidden = not first_login_needed(profile)   # 1er run visible (login), ensuite hors-ecran
+    if not launch(port, profile, hidden=hidden):
         return None
     for _ in range(int(wait / 0.7) + 1):
         time.sleep(0.7)
