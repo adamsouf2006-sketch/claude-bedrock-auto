@@ -32,7 +32,77 @@ try:
 except Exception:
     PATCHRIGHT_OK = False
 
+# SCRAPLING (camoufox furtif) = MEME moteur anti-bot que scraper.py, bien plus resistant que
+# patchright chromium aux captchas Google Lens / Datadome. Si dispo, on l'utilise comme moteur
+# par defaut pour les fetches Lens (override ALI_ENGINE=patchright pour forcer l'ancien moteur).
+try:
+    from scrapling.fetchers import AsyncStealthySession
+    SCRAPLING_OK = True
+except Exception:
+    SCRAPLING_OK = False
+
+# Au moins un moteur navigateur dispo (scrapling/camoufox OU patchright/chromium).
+ENGINE_OK = PATCHRIGHT_OK or SCRAPLING_OK
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+
+# ROTATION User-Agent: Google Lens flag les sessions a UA fixe/repete. On cycle un pool de
+# UA Chrome/Firefox recents (desktop) => chaque contexte parait un appareil different.
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+import random as _rnd
+def _pick_ua():
+    return _rnd.choice(_UA_POOL)
+
+# PROXIES: on REUTILISE le pool valide de scraper.py (Webshare/residentiel via config, ou
+# proxies gratuits recoltes). Rotation d'IP => aucune IP flaggee, captcha Lens reparti.
+_proxy_idx = 0
+def _proxy_pool():
+    try:
+        import scraper
+        return list(getattr(scraper, "_PROXIES", []) or [])
+    except Exception:
+        return []
+def _next_proxy_raw():
+    """Retourne le prochain proxy du pool sous forme STRING 'http://user:pass@ip:port'
+    (format scrapling/camoufox), ou None. Cycle le pool a chaque appel (rotation par relance)."""
+    global _proxy_idx
+    pool = _proxy_pool()
+    if not pool:
+        return None
+    raw = pool[_proxy_idx % len(pool)]; _proxy_idx += 1
+    return raw
+def _to_pw_proxy(raw):
+    """STRING proxy -> dict playwright {server,username,password}, ou None."""
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlsplit
+        u = urlsplit(raw)
+        d = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+        if u.username: d["username"] = u.username
+        if u.password: d["password"] = u.password
+        return d
+    except Exception:
+        return None
+
+# STEALTH: masque les signaux d'automation que Google lit (navigator.webdriver, plugins vides,
+# languages absentes, chrome runtime manquant). patchright est deja stealth mais ce script
+# couvre les fuites residuelles => moins de challenges "trafic inhabituel".
+_STEALTH_JS = r"""
+  Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+  Object.defineProperty(navigator, 'languages', {get: () => ['fr-FR','fr','en-US','en']});
+  Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+  window.chrome = window.chrome || {runtime: {}};
+  const _q = navigator.permissions && navigator.permissions.query;
+  if (_q) navigator.permissions.query = (p) => p && p.name === 'notifications'
+      ? Promise.resolve({state: Notification.permission}) : _q(p);
+"""
 
 # Upload image AliExpress bloque par anti-automation (l'input n'apparait que sur vrai
 # geste humain). Par defaut on saute l'image et on valide par TEXTE (fiable, ~5s).
@@ -216,7 +286,8 @@ async def _lens_ali_search(pg, image_url):
             cand = cand.filter(im => { const s=im.src||im.getAttribute('data-src')||''; return s && !/favicon|faviconV2|sprite/i.test(s); });
             cand.sort((p,q)=>((q.naturalWidth*q.naturalHeight)||(q.width*q.height)||0)-((p.naturalWidth*p.naturalHeight)||(p.width*p.height)||0));
             const im = cand[0];
-            return im ? (im.src || im.getAttribute('data-src') || '') : '';
+            const area = im ? ((im.naturalWidth*im.naturalHeight)||(im.width*im.height)||0) : 0;
+            return { src: im ? (im.src || im.getAttribute('data-src') || '') : '', area: area };
         };
         // Google emballe souvent les liens resultats: /url?q=<vraie_url>, ?url=, ?imgurl=.
         // On deballe pour retrouver le vrai domaine marchand (sinon host = google.com => rate).
@@ -243,9 +314,16 @@ async def _lens_ali_search(pg, image_url):
                 const h = new URL(real).hostname;
                 if (!(ALI.test(h) && ALI_ITEM.test(real)) || ALI_SKIP.test(real)) return;
                 let t = (a.getAttribute('aria-label') || a.title || a.textContent || '').trim();
-                const thumb = pickThumb(a);
+                const tb = pickThumb(a);
+                const thumb = tb.src;
                 if (!t && thumb) { const im0=a.querySelector('img'); t = im0 ? (im0.alt||'') : ''; }
-                out.push({url: real, host: h, ali: true, txt: t.slice(0, 120), price: priceNear(a), img: thumb});
+                const pr = priceNear(a);
+                // vm = lien dans la ZONE de correspondances visuelles Lens (vraie carte produit):
+                // vignette produit de taille reelle (area>=2500 ~ >=50x50) ET prix proche. Les liens
+                // hors-sujet ("people also search", recos bas de page) n'ont ni vraie vignette ni prix
+                // => vm=false => ignores quand des vm existent (coupe faux positifs page-wide).
+                const vm = !!(thumb && tb.area >= 2500 && pr);
+                out.push({url: real, host: h, ali: true, txt: t.slice(0, 120), price: pr, img: thumb, vm: vm});
             } catch(e) {}
         });
         const seen = new Set(), res = [];
@@ -261,7 +339,9 @@ async def _lens_ali_search(pg, image_url):
     stable = 0
     for i in range(14):                 # ~8s max
         if "/sorry/" in (pg.url or ""): # Google captcha (surtout en headless)
-            return list(acc.values())
+            if acc:
+                break                   # on a deja des liens => on les garde
+            return None                 # 0 lien + captcha => signal CAPTCHA (=> rotation proxy)
         try:
             links = await pg.evaluate(JS)
         except Exception:
@@ -279,7 +359,12 @@ async def _lens_ali_search(pg, image_url):
         except Exception:
             pass
         await pg.wait_for_timeout(550)
-    return list(acc.values())
+    vals = list(acc.values())
+    # PRECISION: si Lens a remonte >=1 vraie carte de correspondance visuelle (vm=True:
+    # vignette produit + prix), on IGNORE les liens AliExpress page-wide (sections "people
+    # also search"/recos) => coupe les faux positifs ou Lens lie un AliExpress sans rapport.
+    vm = [o for o in vals if o.get("vm")]
+    return vm if vm else vals
 
 # ---- recherche image YANDEX (2e moteur gratuit, par URL => pas d'upload/Datadome) -------
 # Yandex est le meilleur reverse-image pour retrouver le produit EXACT sur AliExpress
@@ -500,6 +585,14 @@ VERIFY = _os.environ.get("ALI_VERIFY", "1") not in ("0", "false", "no")
 VERIFY_GATE = _os.environ.get("ALI_VERIFY_GATE", "0") not in ("0", "false", "no")
 try: VERIFY_THRESH = int(_os.environ.get("ALI_VERIFY_THRESH", "18"))
 except Exception: VERIFY_THRESH = 18
+# CONFIRMATION PAGE PRODUIT: la vignette Lens est un CROP Google (recadre/recompresse) =>
+# hash bruite. Source de verite = la VRAIE photo produit AliExpress (meta og:image de la page
+# item). On ouvre les TOPN meilleurs candidats, on telecharge l'og:image et on hash-compare a
+# la photo Etsy. Si une page confirme (dist <= STRONG_MAX), c'est la PREUVE forte "meme image".
+# Active par defaut (precision max). ALI_CONFIRM_PAGE=0 pour couper. Borne TOPN pour le temps.
+CONFIRM_PAGE = _os.environ.get("ALI_CONFIRM_PAGE", "1") not in ("0", "false", "no")
+try: CONFIRM_TOPN = max(1, int(_os.environ.get("ALI_CONFIRM_TOPN", "2")))
+except Exception: CONFIRM_TOPN = 2
 
 def _thumb_bytes(src):
     if not src:
@@ -546,6 +639,13 @@ def _verify_results(etsy_hash, results, thresh=VERIFY_THRESH, topn=5):
 #   faible : trouve par le moteur mais image NON confirmee (titre/proximite) -> 15 pts, PAS hit
 _HASH_EXACT = 8
 _HASH_STRONG = 14
+# Borne sup pour "strong": un match Lens ne compte comme hit QUE si la vignette AliExpress
+# est PROCHE de la photo Etsy (dmin <= _HASH_STRONG_MAX). Au-dela, c'est un produit DIFFERENT
+# de la meme categorie (ex: deux bols en bois d'olivier, l'artisan et l'usine) => faux positif.
+# Diag: le MEME produit avec une photo differente donne d<=18 => 22 laisse une marge de securite.
+# Tunable via env ALI_HASH_STRONG_MAX (baisser pour + de precision, monter pour + de recall).
+try: _HASH_STRONG_MAX = int(_os.environ.get("ALI_HASH_STRONG_MAX", "22"))
+except Exception: _HASH_STRONG_MAX = 22
 _POINTS = {"exact": 70, "strong": 40, "weak": 15, "none": 0}
 # Un produit ne compte comme "trouve sur AliExpress" (hit dropship) QUE si l'image est
 # confirmee (exact|strong). weak = moteur a remonte un lien mais image pas identique => PAS dropship.
@@ -568,14 +668,25 @@ def _dedup_unique(results):
 
 def _grade(best_sim, verified, dmin):
     """Force du match -> (label, points). Appele UNIQUEMENT quand Google Lens a deja renvoye un
-    lien produit AliExpress (= match visuel deep-feature confirme par Google). Donc le plancher
-    est "strong". Si en plus le hash perceptuel confirme l'image quasi-identique => "exact".
-    On NE re-rejette PAS sur le hash: le diag a montre que la MEME louche Etsy/AliExpress donne
-    d=18 (angle/lumiere differents) alors que c'est bien le meme produit => le hash strict
-    produisait des faux NEGATIFS. Lens est le juge; le hash ne fait que monter exact vs strong."""
+    lien produit AliExpress (= match visuel deep-feature confirme par Google).
+    PRECISION: un match ne compte comme hit (exact|strong) QUE si l'image AliExpress est PROCHE
+    de la photo Etsy (hash perceptuel). Sans cette confirmation, c'est "weak" (Lens a trouve un
+    lien mais on ne peut pas prouver que c'est le MEME produit => pas de hit dropship).
+      exact  : vignette quasi pixel-identique (dmin <= EXACT)                    -> 70 pts, HIT
+      strong : vignette proche, meme produit angle/eclairage differents (<=MAX)  -> 40 pts, HIT
+      weak   : vignette trop differente (>MAX) OU non verifiable (dmin=None)      -> 15 pts, PAS hit
+    Le diag: le meme produit avec photo differente donne d<=18 => _HASH_STRONG_MAX=22 laisse
+    une marge tout en rejetant les produits DIFFERENTS d'une meme categorie (ex: deux bols en
+    bois d'olivier artisan vs usine -> d>25). Elimine les faux positifs ou des artisans font
+    des produits SIMILAIRES a des produits AliExpress sans les revendre.
+    Note: le vol de photo (vendeur AliExpress qui copie la photo d'un artisan) donne un "exact"
+    faux positif — non detectable au niveau image seul (meme image = meme hash). Le signal
+    vient alors de l'age/ventes de la boutique (cf etsy_core.py dropship_score)."""
     if verified and dmin is not None and dmin <= _HASH_EXACT:
         return "exact", _POINTS["exact"]
-    return "strong", _POINTS["strong"]
+    if dmin is not None and dmin <= _HASH_STRONG_MAX:
+        return "strong", _POINTS["strong"]
+    return "weak", _POINTS["weak"]
 
 def _build_detail(title, results, src, verified=False, dmin=None):
     """[{url,txt,price}] -> detail {ali,n,n_unique,sim,strength,points,src,ali_price?,verified}.
@@ -602,24 +713,44 @@ def _build_detail(title, results, src, verified=False, dmin=None):
 async def _check_lens(pg, prod):
     """PHASE parallelisable: 2 moteurs reverse-image GRATUITS par URL (zero upload => pas de
     Datadome). Google Lens d'abord (rapide) sur chaque image; si aucun lien AliExpress, Yandex
-    (meilleur pour retrouver le produit exact sur AliExpress). Retourne (hit, via, detail)."""
+    (meilleur pour retrouver le produit exact sur AliExpress). Retourne (hit, via, detail).
+    PRECISION: un match ne compte comme hit QUE si l'image est confirmee (exact|strong via
+    _grade). Si Lens trouve un lien mais l'AliExpress vignette est trop differente (weak),
+    on essaie la prochaine image avant de declarer un miss."""
     title = prod.get("title", "")
     imgs = [u for u in (prod.get("image_urls") or [prod.get("image_url")]) if u][:3]
     if not (TRY_IMAGE and imgs):
         return (False, "no_image", {})
-    # 1) Google Lens sur chaque image (arret au 1er hit VERIFIE)
+    # 1) Google Lens sur chaque image. PRECISION: arret au 1er hit dont l'image est CONFIRMEE
+    # (exact|strong). Un resultat "weak" (lien trouve mais image differente) ne suffit pas =>
+    # on essaie une autre vue du produit (peut-etre que la 2e photo matchera mieux).
+    captcha = False
     for img in imgs:
         try:
             results = await _lens_ali_search(pg, img)
         except Exception:
             results = []
+        if results is None:             # Lens a servi un captcha => IP a rotater, on n'insiste pas
+            captcha = True
+            break
         if results:
-            # HIT: Google Lens a renvoye un lien produit AliExpress => match visuel confirme par
-            # Google (deep-features). On NE re-filtre PAS sur le hash (faux negatifs). Le hash
-            # sert juste a distinguer exact vs strong (advisory) si VERIFY actif.
             ok, vr, dmin = await _verified(img, results)
+            # CONFIRMATION page produit = SOURCE DE VERITE: la vraie photo AliExpress (og:image)
+            # remplace le crop Lens bruite. Si une page confirme => hit fort; si une page lue
+            # montre une image DIFFERENTE (dpage > STRONG_MAX) => on rejette (precision: Lens a
+            # lie un lien mais ce n'est pas le meme produit). Pages bloquees (Datadome, dpage=None)
+            # => on garde le grading Lens (recall preserve).
+            conf = False
+            if CONFIRM_PAGE:
+                import asyncio as _a
+                eh = await _a.to_thread(lambda: _ahash(_download(img)))
+                conf, dpage = await _confirm_via_page(pg, eh, title, results)
+                if dpage is not None:
+                    dmin = dpage; vr = True
             d = _build_detail(title, results, "aliexpress", verified=vr, dmin=dmin)
-            return (True, "image", d)
+            d["page_confirmed"] = bool(conf)
+            if _is_hit(d.get("strength")):
+                return (True, "image", d)
     # 2) Yandex sur chaque image (2e moteur, recall AliExpress superieur)
     if YANDEX_FALLBACK:
         for img in imgs:
@@ -630,7 +761,10 @@ async def _check_lens(pg, prod):
             if ry:
                 ok, vr, dmin = await _verified(img, ry)
                 d = _build_detail(title, ry, "aliexpress", verified=vr, dmin=dmin)
-                return (True, "yandex", d)
+                if _is_hit(d.get("strength")):
+                    return (True, "yandex", d)
+    if captcha:                         # aucun hit ET captcha => via=captcha (=> retry proxy rotate)
+        return (False, "captcha", {"n": 0})
     return (False, "image", {"n": 0})
 
 async def _verified(img, results):
@@ -648,6 +782,45 @@ async def _verified(img, results):
     if VERIFY_GATE and comparable:
         return kept, verified, dmin     # strict: vignettes comparables => exige un match hash
     return results, verified, dmin      # advisory: garde le recall, annote la confiance
+
+async def _confirm_via_page(pg, etsy_hash, title, results, topn=CONFIRM_TOPN):
+    """PREUVE FORTE: ouvre les TOPN candidats AliExpress (tries par sim titre) et compare la
+    VRAIE photo produit (meta og:image de la page item) a la photo Etsy par hash perceptuel.
+    La page produit donne l'image SOURCE (pas le crop Google de Lens) => hash fiable.
+    Retourne (confirmed_bool, dmin_page) ou (False, None). dmin_page = meilleure distance
+    obtenue sur une page reellement ouverte (None si aucune page n'a pu etre lue/hashee)."""
+    if etsy_hash is None or not results:
+        return False, None
+    ranked = sorted(results, key=lambda r: -_sim(title, (r.get("txt") or "")))
+    dmin = None
+    for r in ranked[:topn]:
+        url = r.get("url")
+        if not url:
+            continue
+        try:
+            await pg.goto(url, wait_until="domcontentloaded", timeout=25000)
+        except Exception:
+            continue
+        if _ali_blocked(pg):            # Datadome => on n'insiste pas (pas de penalite)
+            continue
+        try:
+            og = await pg.evaluate(
+                """() => { const m=document.querySelector('meta[property="og:image"],meta[name="og:image"]');
+                           let s=m?m.content:''; if(!s){const im=document.querySelector('img[src*="alicdn"]'); s=im?im.src:'';}
+                           return s||''; }""")
+        except Exception:
+            og = ""
+        if not og:
+            continue
+        import asyncio as _a
+        h = await _a.to_thread(lambda: _ahash(_download(og)))
+        if h is None:
+            continue
+        d = _hamming(etsy_hash, h)
+        dmin = d if dmin is None else min(dmin, d)
+        if d <= _HASH_STRONG_MAX:       # confirme: meme image a la source AliExpress
+            return True, dmin
+    return False, dmin
 
 async def _check_native(pg, prod):
     """PHASE 2 (SERIE, pas en parallele sinon Datadome): recherche image NATIVE AliExpress
@@ -675,31 +848,83 @@ async def _check_native(pg, prod):
 
 async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test_all=False):
     res = {"checked": 0, "hits": 0, "total": len(products), "via": {}, "matches": []}
-    if not PATCHRIGHT_OK or not products:
-        res["error"] = "patchright indisponible" if not PATCHRIGHT_OK else "pas de produit"
+    if not ENGINE_OK or not products:
+        res["error"] = "moteur navigateur indisponible" if not ENGINE_OK else "pas de produit"
         res["validated"] = False
         return res
     # Google Lens captcha SYSTEMATIQUEMENT les navigateurs headless (page /sorry/ =
     # "unusual traffic"). En mode visible il ne challenge pas. On FORCE donc le mode
     # visible et on pousse la fenetre hors-ecran (comme scraper.py) pour ne pas gener.
     headless = False
-    async with async_playwright() as p:
-        br = await p.chromium.launch(headless=headless)
-        ctx = await br.new_context(locale="fr-FR", viewport={"width":1440,"height":900}, user_agent=UA)
+    import os as _os3
+    try: conc = max(1, int(_os3.environ.get("ALI_CONC", "3")))
+    except Exception: conc = 3
+    # ROUNDS anti-captcha: si Lens challenge (via=captcha), on RELANCE le navigateur avec une
+    # nouvelle IP (proxy suivant) + nouveau UA + stealth, et on RE-teste UNIQUEMENT les produits
+    # captcha'd. Borne par ALI_PROXY_ROUNDS (def 2) ET par la dispo de proxies (sans pool, 1 seul
+    # round: rotater l'UA sans changer d'IP ne leve pas un captcha deja servi).
+    try: max_rounds = max(1, int(_os3.environ.get("ALI_PROXY_ROUNDS", "2")))
+    except Exception: max_rounds = 2
+    pool = _proxy_pool()
+    # MOTEUR: scrapling (camoufox furtif, MEME anti-bot que scraper.py) par defaut s'il est
+    # installe => bien plus resistant aux captchas Lens que patchright chromium. Override
+    # ALI_ENGINE=patchright pour forcer l'ancien moteur.
+    engine = _os3.environ.get("ALI_ENGINE", "scrapling" if SCRAPLING_OK else "patchright").lower()
+    if engine == "scrapling" and not SCRAPLING_OK:
+        engine = "patchright"
+
+    # --- moteur SCRAPLING: 1 AsyncStealthySession (camoufox), pages via page_action. Comme
+    # une page camoufox EST une page Playwright standard, _check_lens tourne dessus sans
+    # modification (goto/evaluate/scroll identiques). ---
+    async def _round_scrapling(proxy_raw, prods):
+        # PAS d'init_script ici: camoufox (scrapling stealth) est deja furtif, et passer notre
+        # init_script casse la resolution DNS du contexte (ERR_NAME_NOT_RESOLVED sur tout goto).
+        # Le stealth JS ne sert qu'au moteur patchright/chromium (cf _round_patchright).
+        kw = dict(headless=headless, max_pages=max(1, min(conc, len(prods))), network_idle=False,
+                  block_webrtc=True, hide_canvas=True,
+                  useragent=_pick_ua(), disable_resources=False)
+        if proxy_raw: kw["proxy"] = proxy_raw
+        sess = AsyncStealthySession(**kw)
+        await sess.start()
         try:
-            import scraper; scraper.start_window_hider()   # fenetre Chrome hors-ecran
-        except Exception:
-            pass
-        # PARALLELISME: on teste plusieurs produits EN MEME TEMPS, chacun sur sa propre page
-        # (le goulot = la latence reseau Lens/AliExpress, pas le CPU). ~CONC produits a la
-        # fois => temps total ~ temps_par_produit * ceil(N/CONC) au lieu de la somme. Mode
-        # visible conserve (Lens ne challenge pas). CONC modere (3) pour ne pas declencher
-        # de captcha "trafic exceptionnel".
-        import os as _os3
-        try: conc = max(1, int(_os3.environ.get("ALI_CONC", "3")))
-        except Exception: conc = 3
+            import scraper; scraper.start_window_hider()
+        except Exception: pass
         sem = asyncio.Semaphore(conc)
-        async def _lens(prod):
+        async def _one(prod):
+            async with sem:
+                holder = {"r": (False, "erreur", {})}
+                async def act(page):
+                    try: holder["r"] = await _check_lens(page, prod)
+                    except Exception: holder["r"] = (False, "erreur", {})
+                    return page
+                try:
+                    await sess.fetch("https://lens.google.com/", page_action=act,
+                                     network_idle=False, load_dom=False, timeout=70000)
+                except Exception:
+                    pass
+                return prod, holder["r"]
+        try:
+            out = await asyncio.gather(*[_one(p) for p in prods])
+        finally:
+            try: await sess.close()
+            except Exception: pass
+        return {id(prod): r for prod, r in out}
+
+    # --- moteur PATCHRIGHT (fallback): contexte chromium + UA/stealth + pages paralleles. ---
+    async def _round_patchright(p, proxy_raw, prods):
+        kw = {"headless": headless}
+        pw = _to_pw_proxy(proxy_raw)
+        if pw: kw["proxy"] = pw
+        br = await p.chromium.launch(**kw)
+        ctx = await br.new_context(locale="fr-FR", viewport={"width":1440,"height":900},
+                                   user_agent=_pick_ua())
+        try: await ctx.add_init_script(_STEALTH_JS)
+        except Exception: pass
+        try:
+            import scraper; scraper.start_window_hider()
+        except Exception: pass
+        sem = asyncio.Semaphore(conc)
+        async def _one(prod):
             async with sem:
                 pg = await ctx.new_page()
                 try:
@@ -709,37 +934,45 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
                 finally:
                     try: await pg.close()
                     except Exception: pass
-        # PHASE 1 — Lens en PARALLELE (rapide, robuste): couvre la majorite des produits.
-        lens_out = await asyncio.gather(*[_lens(p) for p in products])
-        outcome = {}                              # id(prod) -> (hit, via, detail)
-        misses = []
-        for prod, r1 in lens_out:
-            outcome[id(prod)] = r1
-            if not r1[0] and r1[1] != "no_image":
-                misses.append(prod)
-        # PHASE 2 — NATIF en SERIE sur les ratés Lens (1 session AliExpress a la fois => pas
-        # de Datadome). Recupere les produits que Lens ne relie pas a une URL AliExpress.
-        if NATIVE_FALLBACK and misses:
-            npg = await ctx.new_page()
-            try:
-                for prod in misses:
-                    try:
-                        r2 = await _check_native(npg, prod)
-                    except Exception:
-                        r2 = (False, "image", {})
-                    if r2[0]:
-                        outcome[id(prod)] = r2
-            finally:
-                try: await npg.close()
-                except Exception: pass
-        for prod in products:
-            hit, via, detail = outcome[id(prod)]
-            res["checked"] += 1
-            res["via"][via] = res["via"].get(via, 0) + 1
-            if hit:
-                res["hits"] += 1
-                res["matches"].append({"title": prod.get("title","")[:60], "via": via, **detail})
-        await br.close()
+        try:
+            out = await asyncio.gather(*[_one(p) for p in prods])
+        finally:
+            try: await br.close()
+            except Exception: pass
+        return {id(prod): r for prod, r in out}
+
+    async def _drive(p):
+        """Boucle de rounds anti-captcha commune aux 2 moteurs. p = playwright ctx (patchright)
+        ou None (scrapling). Remplit `outcome` et flag res['blocked'] si captcha persistant."""
+        outcome = {}
+        todo = list(products)
+        proxy_raw = _next_proxy_raw() if pool else None
+        for rnd in range(max_rounds):
+            if engine == "scrapling":
+                res_round = await _round_scrapling(proxy_raw, todo)
+            else:
+                res_round = await _round_patchright(p, proxy_raw, todo)
+            outcome.update(res_round)
+            todo = [pr for pr in todo if outcome.get(id(pr), (0, "", 0))[1] == "captcha"]
+            if not todo or not pool:
+                break
+            proxy_raw = _next_proxy_raw()         # IP suivante au round suivant
+        if todo:
+            res["blocked"] = True
+        return outcome
+
+    if engine == "scrapling":
+        outcome = await _drive(None)
+    else:
+        async with async_playwright() as p:
+            outcome = await _drive(p)
+    for prod in products:
+        hit, via, detail = outcome[id(prod)]
+        res["checked"] += 1
+        res["via"][via] = res["via"].get(via, 0) + 1
+        if hit:
+            res["hits"] += 1
+            res["matches"].append({"title": prod.get("title","")[:60], "via": via, **detail})
     if res.get("blocked"):
         res["validated"] = None   # inconnu (AliExpress a bloque)
     else:
@@ -763,8 +996,8 @@ def validate_shop(products, min_match=3, hash_thresh=12, sim_thresh=0.30, headle
     fallback texte si l'upload image est bloque. Boutique validee si >= min_match trouves.
     headless=None => non-headless par defaut (patchright stealth passe mieux l'anti-bot
     AliExpress/Datadome). Override via env ALI_HEADLESS=1."""
-    if not PATCHRIGHT_OK:
-        return {"validated": False, "hits": 0, "total": len(products or []), "error": "patchright indisponible"}
+    if not ENGINE_OK:
+        return {"validated": False, "hits": 0, "total": len(products or []), "error": "moteur navigateur indisponible"}
     if headless is None:
         import os as _os
         headless = _os.environ.get("ALI_HEADLESS", "0") in ("1", "true", "yes")
