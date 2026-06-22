@@ -1927,6 +1927,30 @@ def _ali_text_validate(shops, nprod, min_match, sim_thresh):
         s["ali_matches"] = matches
         s["ali_validated"] = None if blocked else (hits >= min_match)
 
+def _smart_sample_idx(pool, k, seed=0):
+    """Sampling intelligent SANS API (mode scrape): choisit k indices dans un pool de `pool`
+    produits scrapes (ordre page Etsy = ranking interne deja optimise). Repartition:
+      ~50% top page (premiers listings = mis en avant par Etsy / conversion+SEO),
+      ~30% milieu (page 2-3 = variete / declinaisons),
+      ~20% aleatoire (couverture, anti-biais).
+    Deterministe par `seed` (id boutique) => reproductible. Si pool <= k: tout prendre."""
+    if pool <= 0:
+        return []
+    if pool <= k:
+        return list(range(pool))
+    import random as _rnd
+    rnd = _rnd.Random(seed)
+    top_end = max(1, int(pool * 0.4))
+    mid_end = max(top_end + 1, int(pool * 0.8))
+    n_top = min(max(1, round(k * 0.5)), top_end)
+    n_mid = max(1, round(k * 0.3))
+    sel = list(range(n_top))                         # top page bias = premiers listings
+    mid = list(range(top_end, mid_end)); rnd.shuffle(mid)
+    sel += mid[:n_mid]
+    rest = [i for i in range(pool) if i not in set(sel)]; rnd.shuffle(rest)
+    sel += rest[:max(0, k - len(sel))]
+    return sorted(set(sel))[:k]
+
 def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=True, stop=None):
     """Verifie si les produits d'une boutique existent A L'IDENTIQUE sur AliExpress.
 
@@ -1958,18 +1982,27 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
             s.setdefault("ali_validated", None); s.setdefault("ali_hits", 0)
             s.setdefault("ali_blocked", False); s.setdefault("ali_matches", [])
             continue
-        titles = (s.get("titles") or [s.get("sample", "")])[:nprod]
+        raw_titles = s.get("titles") or [s.get("sample", "")]
+        raw_imgs = s.get("images") or []
+        titles = raw_titles[:nprod]
         # Source des images produit:
         # - MODE SCRAPE: le scraper a deja recupere les images de la page boutique
         #   (s["images"], alignees sur s["titles"]) => 0 appel API Etsy.
         # - MODE API/DISCOVERY: pas d'images scrapees => on les recupere via l'API Etsy
         #   (id numerique de boutique requis). Si s["id"] n'est pas numerique (scrape),
         #   l'appel API echouerait => on ne le tente QUE si pas d'images scrapees ET id numerique.
-        scraped_imgs = [u for u in (s.get("images") or []) if u]
+        has_scraped = any(raw_imgs)
         # prod_imgs = liste alignee aux titres, chaque element = liste de 1-2 images du
         # MEME produit (2e image = 2e chance de match AliExpress si la 1re rate).
-        if scraped_imgs:
-            prod_imgs = [[u] for u in scraped_imgs[:nprod]]
+        if has_scraped:
+            # SAMPLING INTELLIGENT (sans API): le scraper ramene jusqu'a 48 produits dans
+            # l'ordre de la page Etsy (ranking interne). On echantillonne nprod indices
+            # (top page + milieu + aleatoire) au lieu de prendre betement les premiers, et on
+            # applique les MEMES indices aux titres ET aux images (alignement strict).
+            pool = min(len(raw_titles), len(raw_imgs))
+            idx = _smart_sample_idx(pool, nprod, seed=hash(str(s.get("id") or s.get("name") or "")) & 0xffffffff)
+            titles = [raw_titles[i] for i in idx]
+            prod_imgs = [([raw_imgs[i]] if raw_imgs[i] else []) for i in idx]
         elif str(s.get("id", "")).isdigit():
             ids = fetch_shop_listing_ids(s["id"], n=nprod)
             if ids: api += 1
@@ -2001,6 +2034,41 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # PRECISION: nb de matches confirmes par hash perceptuel (vignette AliExpress ~= photo
         # Etsy). Signal de confiance affiche; gating strict optionnel via ALI_VERIFY_GATE=1.
         s["ali_verified"] = sum(1 for m in r.get("matches", []) if m.get("verified"))
+        # FORCE DES MATCHES (point 4): chaque produit trouve est grade exact/strong/weak avec
+        # des points (70/40/15). On compte chaque categorie + le score MOYEN par produit trouve.
+        # Verdict simple par boutique sur la moyenne: >=70 dropship probable, 40-70 douteux,
+        # <40 probablement original (label feu tricolore pour l'UI: green/orange/red).
+        _ms = r.get("matches", [])
+        s["ali_exact"] = sum(1 for m in _ms if m.get("strength") == "exact")
+        s["ali_strong"] = sum(1 for m in _ms if m.get("strength") == "strong")
+        s["ali_weak"] = sum(1 for m in _ms if m.get("strength") == "weak")
+        _pts = [m.get("points", 0) for m in _ms if m.get("points") is not None]
+        avg_pts = (sum(_pts) / len(_pts)) if _pts else 0
+        s["ali_match_points"] = round(avg_pts)
+        if avg_pts >= 70:
+            s["ali_match_verdict"] = "dropship"      # 🟢 verified image match
+        elif avg_pts >= 40:
+            s["ali_match_verdict"] = "doubtful"       # 🟠 possible match
+        else:
+            s["ali_match_verdict"] = "original"       # 🔴 no/weak match
+        # VERDICT PAR PROPORTION (le vrai signal: pas "1 produit = dropship" mais la PART de
+        # produits trouves sur AliExpress sur l'echantillon teste). Seuils:
+        #   0 match            -> original (boutique probablement artisanale)
+        #   1-2 matches        -> doute (rebrand / mix supply)
+        #   coverage >= 70%    -> dropship quasi-certain
+        #   3+ matches         -> dropship probable
+        # checked = nb produits reellement testes (echantillon best-sellers via sort_on=score).
+        _hits = r.get("hits", 0); _cov = float(r.get("coverage") or 0.0)
+        if s.get("ali_blocked"):
+            s["ali_supply_verdict"] = None
+        elif _hits == 0:
+            s["ali_supply_verdict"] = "original"
+        elif _cov >= 0.70:
+            s["ali_supply_verdict"] = "dropship_certain"
+        elif _hits >= 3:
+            s["ali_supply_verdict"] = "dropship_likely"
+        else:
+            s["ali_supply_verdict"] = "doubt"
         # PRIX AliExpress (cout d'achat dropshipper) recuperes via Lens.
         s["ali_price_min"] = r.get("ali_price_min")
         s["ali_price_avg"] = r.get("ali_price_avg")

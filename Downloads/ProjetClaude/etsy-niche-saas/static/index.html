@@ -220,6 +220,19 @@ function tbl(shops){
       const ap=s.ali_price_med??s.ali_price_min;
       if(ap!=null){extra+=` · <b>$${ap}</b> AliE`;}
       if(s.ali_margin_ratio!=null){extra+=` · ×${s.ali_margin_ratio} marge`;}
+      // Feu tricolore force du match image (point 4): 🟢 image identique, 🟠 possible, 🔴 faible
+      if(s.ali_match_verdict){
+        const fv={dropship:"🟢",doubtful:"🟠",original:"🔴"}[s.ali_match_verdict]||"";
+        extra+=` · ${fv}${s.ali_match_points!=null?" "+s.ali_match_points+"pts":""}`;
+        const eg=(s.ali_exact||0),st=(s.ali_strong||0);
+        if(eg||st){extra+=` (${eg} exact, ${st} fort)`;}
+      }
+      // Verdict par proportion de produits trouves sur AliExpress (le vrai signal pattern)
+      if(s.ali_supply_verdict){
+        const sv={dropship_certain:"🔴 dropship quasi-sûr",dropship_likely:"🟠 dropship probable",
+                  doubt:"🟡 doute (mix/rebrand)",original:"🟢 original"}[s.ali_supply_verdict]||"";
+        if(sv){extra+=` · ${sv}`;}
+      }
       const sc=s.dropship_score100;
       const scTag=sc!=null?` <b style="color:${sc>=60?'#2e7d32':sc>=35?'#e08600':'#999'}">${sc}/100</b>`:"";
       aliCell=`<td>${icon}${scTag} <span class="mut">${s.ali_blocked?"bloqué":(s.ali_hits??0)}${via?" ·"+via:""}${extra}</span></td>`;

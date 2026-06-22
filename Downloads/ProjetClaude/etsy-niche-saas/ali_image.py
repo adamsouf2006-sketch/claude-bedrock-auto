@@ -47,24 +47,59 @@ YANDEX_FALLBACK = _os.environ.get("ALI_YANDEX", "0") not in ("0", "false", "no")
 # FALLBACK natif AliExpress (upload image par drag-drop simule). Active par defaut: uploade
 # l'image directement dans le moteur image AliExpress => vrais produits + prix exacts.
 # Override ALI_NATIVE=0. Captcha Datadome gere (pas de penalite boutique).
-NATIVE_FALLBACK = _os.environ.get("ALI_NATIVE", "1") not in ("0", "false", "no")
+# DESACTIVE par defaut: diagnostic a montre que l'upload image native ne marche PAS (drag-drop
+# non pris) => AliExpress renvoie des produits TENDANCE sans rapport (gloss, trottinettes, coques)
+# quelle que soit la photo => BRUIT PUR + source des faux positifs (artisans flagges dropship).
+# Le vrai signal vient de Google Lens (matching visuel deep-feature). Reactiver: ALI_NATIVE=1.
+NATIVE_FALLBACK = _os.environ.get("ALI_NATIVE", "0") not in ("0", "false", "no")
 _CONSENT_DONE = False   # consentement Google accepte une fois par process (cookie persiste)
 
 # ---- perceptual hash (Pillow seul) -------------------------------------------
-def _ahash(img_bytes):
+# On combine DEUX hash: aHash (luminance moyenne) + dHash (gradient horizontal). dHash capte
+# la STRUCTURE de l'image (contours), il est peu sensible au fond uni => discrimine bien deux
+# produits differents sur fond blanc (la ou aHash sature et donne des faux positifs). Un match
+# n'est confirme que si les DEUX hash sont proches (cf _hash_dist).
+def _phash_pair(img_bytes):
+    """Retourne (ahash, dhash) ou None. dhash sur 9x8 (8 comparaisons/ligne = 64 bits)."""
     try:
-        im = Image.open(io.BytesIO(img_bytes)).convert("L").resize((8, 8))
+        base = Image.open(io.BytesIO(img_bytes)).convert("L")
     except Exception:
         return None
-    px = list(im.getdata()); avg = sum(px) / 64.0
-    bits = 0
+    a = base.resize((8, 8))
+    px = list(a.getdata()); avg = sum(px) / 64.0
+    ah = 0
     for i, p in enumerate(px):
         if p > avg:
-            bits |= (1 << i)
-    return bits
+            ah |= (1 << i)
+    d = base.resize((9, 8))
+    dp = list(d.getdata()); dh = 0; bit = 0
+    for row in range(8):
+        for col in range(8):
+            if dp[row * 9 + col] > dp[row * 9 + col + 1]:
+                dh |= (1 << bit)
+            bit += 1
+    return (ah, dh)
+
+def _ahash(img_bytes):
+    """Compat: retourne le couple (ahash, dhash). None si decodage echoue."""
+    return _phash_pair(img_bytes)
+
+def _ham(a, b):
+    return bin(a ^ b).count("1") if (a is not None and b is not None) else 64
+
+def _hash_dist(p, q):
+    """Distance entre deux couples (ahash,dhash) = MAX des deux distances de Hamming. Le MAX
+    (et non la moyenne) impose que les DEUX hash concordent => un faux positif fond-blanc sur
+    aHash est rejete si dHash (structure) diverge. 64 si l'un des couples est absent."""
+    if not p or not q:
+        return 64
+    return max(_ham(p[0], q[0]), _ham(p[1], q[1]))
 
 def _hamming(a, b):
-    return bin(a ^ b).count("1") if (a is not None and b is not None) else 64
+    """Compat: si on recoit des couples -> _hash_dist; sinon Hamming brut sur entiers."""
+    if isinstance(a, tuple) or isinstance(b, tuple):
+        return _hash_dist(a, b)
+    return _ham(a, b)
 
 # ---- parse prix AliExpress (texte carte Lens / page produit) -------------------
 # Lens (resultats shopping/visual match) affiche souvent le prix de l'item AliExpress
@@ -457,7 +492,7 @@ _ALI_PARSE_JS = r"""() => {
 # dropshipper) => aHash donne des FAUX NEGATIFS systematiques. La precision vient deja du
 # matching VISUEL des moteurs (Google Lens / image-search AliExpress) qui utilisent des
 # deep-features robustes (crop/rotation) + filtrage AliExpress-only. Reactiver: ALI_VERIFY=1.
-VERIFY = _os.environ.get("ALI_VERIFY", "0") not in ("0", "false", "no")
+VERIFY = _os.environ.get("ALI_VERIFY", "1") not in ("0", "false", "no")
 # GATING: si actif, un produit n'est "trouve" QUE si >=1 vignette passe le hash (precision
 # max, mais recall plus bas car les vignettes Lens sont des crops Google != photo Etsy).
 # Par defaut ADVISORY: on garde le match et on annote `verified` (les 2 signaux remontent
@@ -480,32 +515,86 @@ def _thumb_bytes(src):
 def _verify_results(etsy_hash, results, thresh=VERIFY_THRESH, topn=5):
     """Garde les resultats dont la vignette est ~identique a l'image Etsy. Si on ne peut pas
     verifier (pas de hash Etsy, ou aucune vignette telechargeable), on NE filtre PAS (on ne
-    sacrifie pas le recall a cause d'une vignette manquante). Retourne (resultats_gardes, verifie?)."""
+    sacrifie pas le recall a cause d'une vignette manquante). Retourne (resultats_gardes,
+    verifie?, distance_hamming_min). dmin = meilleure (plus petite) distance vignette vs photo
+    Etsy => sert a grader la force du match (exact / fort / faible)."""
     if etsy_hash is None:
-        return results, False
-    kept, any_thumb = [], False
+        return results, False, None
+    kept, any_thumb, dmin = [], False, None
     for r in results[:topn]:
         b = _thumb_bytes(r.get("img"))
         if not b:
             continue
         any_thumb = True
         h = _ahash(b)
-        if h is not None and _hamming(etsy_hash, h) <= thresh:
+        if h is None:
+            continue
+        d = _hamming(etsy_hash, h)
+        dmin = d if dmin is None else min(dmin, d)
+        if d <= thresh:
             kept.append(r)
     if not any_thumb:
-        return results, False           # aucune vignette comparable => pas de filtrage
-    return kept, True
+        return results, False, None     # aucune vignette comparable => pas de filtrage
+    return kept, True, dmin
 
-def _build_detail(title, results, src):
-    """[{url,txt,price}] -> detail {ali,n,sim,src,ali_price?}. Classe par similarite titre.
+# Seuils de force du match. PRECISION D'ABORD: la seule preuve fiable de dropship est l'IMAGE
+# IDENTIQUE (hash perceptuel). La similarite de TITRE seule NE compte PAS (un artisan vend un
+# "olive wood bowl" et AliExpress aussi => titre identique mais objet different). Seuils STRICTS
+# pour eviter les faux positifs (aHash sature sur les photos produit fond blanc).
+#   exact  : vignette AliExpress quasi pixel-identique (hash <= EXACT)        -> 70 pts, HIT
+#   fort   : image tres proche (hash <= STRONG)                              -> 40 pts, HIT
+#   faible : trouve par le moteur mais image NON confirmee (titre/proximite) -> 15 pts, PAS hit
+_HASH_EXACT = 8
+_HASH_STRONG = 14
+_POINTS = {"exact": 70, "strong": 40, "weak": 15, "none": 0}
+# Un produit ne compte comme "trouve sur AliExpress" (hit dropship) QUE si l'image est
+# confirmee (exact|strong). weak = moteur a remonte un lien mais image pas identique => PAS dropship.
+_HIT_STRENGTHS = ("exact", "strong")
+def _is_hit(strength):
+    return strength in _HIT_STRENGTHS
+
+def _dedup_unique(results):
+    """Normalisation (point 3): AliExpress reposte le MEME produit (angles differents,
+    vendeurs multiples). On regroupe les cartes a titre quasi-identique (sim >= 0.7) pour
+    ne compter qu'UN produit unique par groupe => evite de sur-estimer le dropship.
+    Garde le 1er representant de chaque groupe. Retourne (representants, n_groupes)."""
+    reps = []
+    for r in results:
+        t = r.get("txt") or ""
+        if any(_sim(t, (rep.get("txt") or "")) >= 0.7 for rep in reps):
+            continue
+        reps.append(r)
+    return reps, len(reps)
+
+def _grade(best_sim, verified, dmin):
+    """Force du match -> (label, points). Appele UNIQUEMENT quand Google Lens a deja renvoye un
+    lien produit AliExpress (= match visuel deep-feature confirme par Google). Donc le plancher
+    est "strong". Si en plus le hash perceptuel confirme l'image quasi-identique => "exact".
+    On NE re-rejette PAS sur le hash: le diag a montre que la MEME louche Etsy/AliExpress donne
+    d=18 (angle/lumiere differents) alors que c'est bien le meme produit => le hash strict
+    produisait des faux NEGATIFS. Lens est le juge; le hash ne fait que monter exact vs strong."""
+    if verified and dmin is not None and dmin <= _HASH_EXACT:
+        return "exact", _POINTS["exact"]
+    return "strong", _POINTS["strong"]
+
+def _build_detail(title, results, src, verified=False, dmin=None):
+    """[{url,txt,price}] -> detail {ali,n,n_unique,sim,strength,points,src,ali_price?,verified}.
+    Classe par similarite titre. Normalise les doublons produit (n_unique). Grade la force du
+    match (exact/strong/weak -> points) a partir du hash perceptuel + similarite titre.
     Prix = MEDIANE de TOUTES les cartes (le moteur image melange le produit et des accessoires
     cheap; la mediane sur l'ensemble est le cout d'achat le + representatif). Le prix reste
     indicatif: la marge dropship sature de toute facon a 5x => le verdict est robuste au bruit."""
     scored = sorted(((_sim(title, (r.get("txt") or "")), r) for r in results), key=lambda x: -x[0])
     best_sim, best = scored[0]
+    _, n_unique = _dedup_unique(results)
     ali_prices = sorted(p for p in (_parse_price(r.get("price")) for r in results) if p is not None)
     price = ali_prices[len(ali_prices)//2] if ali_prices else None
-    detail = {"ali": best["url"], "n": len(results), "sim": round(best_sim, 2), "src": src}
+    strength, points = _grade(best_sim, verified, dmin)
+    detail = {"ali": best["url"], "n": len(results), "n_unique": n_unique,
+              "sim": round(best_sim, 2), "strength": strength, "points": points,
+              "verified": bool(verified), "src": src}
+    if dmin is not None:
+        detail["hash_dist"] = dmin
     if price is not None:
         detail["ali_price"] = round(price, 2)
     return detail
@@ -525,10 +614,12 @@ async def _check_lens(pg, prod):
         except Exception:
             results = []
         if results:
-            ok, vr = await _verified(img, results)
-            if ok:
-                d = _build_detail(title, ok, "aliexpress"); d["verified"] = vr
-                return (True, "image", d)
+            # HIT: Google Lens a renvoye un lien produit AliExpress => match visuel confirme par
+            # Google (deep-features). On NE re-filtre PAS sur le hash (faux negatifs). Le hash
+            # sert juste a distinguer exact vs strong (advisory) si VERIFY actif.
+            ok, vr, dmin = await _verified(img, results)
+            d = _build_detail(title, results, "aliexpress", verified=vr, dmin=dmin)
+            return (True, "image", d)
     # 2) Yandex sur chaque image (2e moteur, recall AliExpress superieur)
     if YANDEX_FALLBACK:
         for img in imgs:
@@ -537,27 +628,26 @@ async def _check_lens(pg, prod):
             except Exception:
                 ry = []
             if ry:
-                ok, vr = await _verified(img, ry)
-                if ok:
-                    d = _build_detail(title, ok, "aliexpress"); d["verified"] = vr
-                    return (True, "yandex", d)
+                ok, vr, dmin = await _verified(img, ry)
+                d = _build_detail(title, ry, "aliexpress", verified=vr, dmin=dmin)
+                return (True, "yandex", d)
     return (False, "image", {"n": 0})
 
 async def _verified(img, results):
     """Confronte les vignettes resultats a l'image Etsy `img` par hash perceptuel.
-    Retourne (resultats_a_utiliser, verified_bool).
+    Retourne (resultats_a_utiliser, verified_bool, distance_hamming_min).
     - ADVISORY (defaut): garde TOUS les resultats, verified=True si >=1 vignette ~identique.
     - GATING (ALI_VERIFY_GATE=1): ne garde QUE les vignettes ~identiques; [] si aucune
       (=> pas de match) MAIS seulement quand des vignettes etaient comparables (sinon recall)."""
     if not VERIFY:
-        return results, False
+        return results, False, None
     import asyncio as _a
     eh = await _a.to_thread(lambda: _ahash(_download(img)))
-    kept, comparable = await _a.to_thread(_verify_results, eh, results)
+    kept, comparable, dmin = await _a.to_thread(_verify_results, eh, results)
     verified = bool(comparable and kept)
     if VERIFY_GATE and comparable:
-        return kept, verified           # strict: vignettes comparables => exige un match hash
-    return results, verified            # advisory: garde le recall, annote la confiance
+        return kept, verified, dmin     # strict: vignettes comparables => exige un match hash
+    return results, verified, dmin      # advisory: garde le recall, annote la confiance
 
 async def _check_native(pg, prod):
     """PHASE 2 (SERIE, pas en parallele sinon Datadome): recherche image NATIVE AliExpress
@@ -574,10 +664,11 @@ async def _check_native(pg, prod):
         except Exception:
             nat, blocked = None, False
         if nat:
-            ok, vr = await _verified(img, nat)
+            ok, vr, dmin = await _verified(img, nat)
             if ok:
-                d = _build_detail(title, ok, "aliexpress_native"); d["verified"] = vr
-                return (True, "native", d)
+                d = _build_detail(title, ok, "aliexpress_native", verified=vr, dmin=dmin)
+                if _is_hit(d.get("strength")):       # HIT seulement si IMAGE confirmee
+                    return (True, "native", d)
         if not blocked:
             break                       # pas de captcha mais 0 resultat => 2e image inutile
     return (False, "image", {"n": 0})
