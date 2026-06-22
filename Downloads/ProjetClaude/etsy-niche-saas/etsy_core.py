@@ -1308,6 +1308,7 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
                 "favorers": 0, "reviews": 0, "review_avg": None, "accepts_custom": None,
                 "sample": (d["titles"][0] if d["titles"] else sample),
                 "titles": d["titles"] or ([sample] if sample else []),
+                "price": d.get("price"),   # prix vente median (JSON-LD) -> marge dropship
                 "images": d.get("images") or []}   # images produit scrapees (validation dropship sans API)
 
     empty_streak = 0; nonew_streak = 0
@@ -1790,11 +1791,12 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
       4. fusion/dedup, retrait de la boutique source, finalize.
     """
     f = dict(filters or {})
-    # CLONE FINDER = trouver des boutiques DROPSHIP-ables: la verif AliExpress est le
-    # COEUR de la feature, on la FORCE (peu importe la case UI). Les produits des
-    # boutiques similaires DOIVENT exister sur AliExpress.
+    # CLONE FINDER: on VALIDE AliExpress pour ETIQUETER chaque boutique (dropship vs artisan),
+    # mais on NE FILTRE PLUS dur (ali_gate=False): on montre TOUTES les boutiques similaires et
+    # on trie les dropship-confirmees en tete. Sinon sur une niche artisanale (ex: ustensiles
+    # bois) le gate dur renvoyait 0 boutique. L'utilisateur voit tout + le statut dropship.
     f["validate_ali"] = True
-    f.setdefault("ali_gate", True)        # ne garder que les boutiques validees
+    f["ali_gate"] = False                  # annoter, pas filtrer (recall preserve)
     f["use_ai"] = True                     # jugement IA dropship (consensus avec Lens)
     scrape_mode = (mode == "scrape")
     name = resolve_shop_name(shop_input)
@@ -1860,7 +1862,13 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
             if progress: progress(len(merged), 0)
         if round_added == 0:                # un tour entier sans NOUVELLE boutique => filon epuise
             break
-    merged.sort(key=lambda x: -x.get("rate", 0))
+    # TRI: dropship confirme d'abord (2), indetermine ensuite (1), artisan/non-dropship en
+    # dernier (0); a rang egal, les meilleures ventes/mois en tete. => l'utilisateur voit les
+    # vraies cibles dropship en haut, sans perdre les autres similaires.
+    def _drop_rank(s):
+        dc = s.get("dropship_confirmed")
+        return 2 if dc is True else (0 if dc is False else 1)
+    merged.sort(key=lambda x: (-_drop_rank(x), -x.get("rate", 0)))
     res = {
         "source": {
             "id": src_id, "name": src.get("name"), "url": src.get("url"),
@@ -1968,7 +1976,9 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
     ok = False
     try:
         import ali_image
-        ok = bool(getattr(ali_image, "PATCHRIGHT_OK", False))
+        ok = bool(getattr(ali_image, "ENGINE_OK", None)
+                  if getattr(ali_image, "ENGINE_OK", None) is not None
+                  else getattr(ali_image, "PATCHRIGHT_OK", False))
     except Exception:
         ok = False
     if not ok:
@@ -2034,6 +2044,9 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # PRECISION: nb de matches confirmes par hash perceptuel (vignette AliExpress ~= photo
         # Etsy). Signal de confiance affiche; gating strict optionnel via ALI_VERIFY_GATE=1.
         s["ali_verified"] = sum(1 for m in r.get("matches", []) if m.get("verified"))
+        # PREUVE FORTE: matches confirmes sur la page produit AliExpress (vraie og:image ~=
+        # photo Etsy, pas le crop Lens). Signal le + fiable de "meme produit a la source".
+        s["ali_page_confirmed"] = sum(1 for m in r.get("matches", []) if m.get("page_confirmed"))
         # FORCE DES MATCHES (point 4): chaque produit trouve est grade exact/strong/weak avec
         # des points (70/40/15). On compte chaque categorie + le score MOYEN par produit trouve.
         # Verdict simple par boutique sur la moyenne: >=70 dropship probable, 40-70 douteux,
@@ -2097,17 +2110,33 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         cov = float(r.get("coverage") or 0.0)           # 0..1 (n_trouves / n_testes)
         s["ali_coverage"] = round(cov, 2)
         ad = s.get("ai_dropship")
-        ai_part = ad if ad is not None else 0.5         # neutre si IA absente
         mr = s.get("ali_margin_ratio")
         margin_norm = min(1.0, (mr - 1.0) / 4.0) if (mr and mr > 1.0) else 0.0  # 1x->0, 5x->1
-        score01 = 0.60 * cov + 0.25 * ai_part + 0.15 * margin_norm
+        # SCORE: si l'IA est absente on n'injecte PLUS un ai_part=0.5 fictif (biais qui
+        # gonflait le score meme sans preuve IA). On renormalise les poids sur les 2
+        # signaux restants: coverage -> 0.80 (0.60/0.75) et marge -> 0.20 (0.15/0.75).
+        if ad is None:
+            score01 = (0.60 / 0.75) * cov + (0.15 / 0.75) * margin_norm
+        else:
+            score01 = 0.60 * cov + 0.25 * ad + 0.15 * margin_norm
         s["dropship_score"] = round(score01, 2)
         s["dropship_score100"] = round(100 * score01)
+        # VERDICT CONSENSUS: un seul signal (Lens) ne suffit pas a confirmer du dropship.
+        # Si l'IA est absente, on exige un 2e signal independant (marge >= 3x) pour
+        # confirmer; sinon le verdict reste INDETERMINE (None) plutot que d'auto-confirmer
+        # (le gate de filtrage etsy_core.py:1651 retombe sur ali_validated quand
+        # dropship_confirmed est None => le recall est preserve, seul le label change).
         margin_boost = bool(mr is not None and mr >= 3.0)
+        # La confirmation page produit est un 2e signal independant fort (vraie image source
+        # AliExpress identique a la photo Etsy) => suffit a confirmer comme la marge.
+        page_boost = bool(s.get("ali_page_confirmed", 0) >= 1)
         if s.get("ali_validated") is None:
             s["dropship_confirmed"] = None
         elif s.get("ali_validated"):
-            s["dropship_confirmed"] = (ad is None) or (ad >= 0.4) or margin_boost
+            if ad is None:
+                s["dropship_confirmed"] = True if (margin_boost or page_boost) else None
+            else:
+                s["dropship_confirmed"] = (ad >= 0.4) or margin_boost or page_boost
         else:
             s["dropship_confirmed"] = False
     return api
