@@ -1,5 +1,5 @@
 @echo off
-REM Lance CraftPilot SANS fenetre terminal qui reste ouverte.
+REM Lance Niche Scout SANS fenetre terminal qui reste ouverte.
 REM Double-clique ce fichier. Le serveur tourne en arriere-plan (pythonw = pas de console),
 REM le navigateur s'ouvre sur l'app, et le Chrome debug (detection dropship) se lance tout seul.
 REM 1re fois: connecte-toi a Google dans la fenetre Chrome qui s'ouvre (une seule fois).
