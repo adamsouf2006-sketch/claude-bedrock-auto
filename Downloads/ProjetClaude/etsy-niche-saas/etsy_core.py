@@ -1998,6 +1998,9 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         s["ali_blocked"] = bool(r.get("blocked"))
         s["ali_matches"] = r.get("matches", [])
         s["ali_validated"] = r.get("validated")
+        # PRECISION: nb de matches confirmes par hash perceptuel (vignette AliExpress ~= photo
+        # Etsy). Signal de confiance affiche; gating strict optionnel via ALI_VERIFY_GATE=1.
+        s["ali_verified"] = sum(1 for m in r.get("matches", []) if m.get("verified"))
         # PRIX AliExpress (cout d'achat dropshipper) recuperes via Lens.
         s["ali_price_min"] = r.get("ali_price_min")
         s["ali_price_avg"] = r.get("ali_price_avg")

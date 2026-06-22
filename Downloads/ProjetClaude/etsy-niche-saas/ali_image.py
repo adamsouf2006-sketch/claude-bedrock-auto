@@ -172,6 +172,17 @@ async def _lens_ali_search(pg, image_url):
             }
             return '';
         };
+        // Choisit la VRAIE vignette produit (la PLUS GRANDE image du conteneur), pas le
+        // favicon du site (petit, src contenant 'favicon') => sinon le hash perceptuel
+        // compare des favicons et ne matche jamais.
+        const pickThumb = (a) => {
+            let cand = [], n = a;
+            for (let i=0;i<4&&n;i++){ if(n.querySelectorAll){ cand.push(...n.querySelectorAll('img')); } n=n.parentElement; }
+            cand = cand.filter(im => { const s=im.src||im.getAttribute('data-src')||''; return s && !/favicon|faviconV2|sprite/i.test(s); });
+            cand.sort((p,q)=>((q.naturalWidth*q.naturalHeight)||(q.width*q.height)||0)-((p.naturalWidth*p.naturalHeight)||(p.width*p.height)||0));
+            const im = cand[0];
+            return im ? (im.src || im.getAttribute('data-src') || '') : '';
+        };
         // Google emballe souvent les liens resultats: /url?q=<vraie_url>, ?url=, ?imgurl=.
         // On deballe pour retrouver le vrai domaine marchand (sinon host = google.com => rate).
         const unwrap = (href) => {
@@ -197,8 +208,9 @@ async def _lens_ali_search(pg, image_url):
                 const h = new URL(real).hostname;
                 if (!(ALI.test(h) && ALI_ITEM.test(real)) || ALI_SKIP.test(real)) return;
                 let t = (a.getAttribute('aria-label') || a.title || a.textContent || '').trim();
-                if (!t) { const im = a.querySelector('img'); t = im ? (im.alt || '') : ''; }
-                out.push({url: real, host: h, ali: true, txt: t.slice(0, 120), price: priceNear(a)});
+                const thumb = pickThumb(a);
+                if (!t && thumb) { const im0=a.querySelector('img'); t = im0 ? (im0.alt||'') : ''; }
+                out.push({url: real, host: h, ali: true, txt: t.slice(0, 120), price: priceNear(a), img: thumb});
             } catch(e) {}
         });
         const seen = new Set(), res = [];
@@ -258,7 +270,12 @@ _YANDEX_JS = r"""() => {
             real = real.split('?')[0].split('%3F')[0];
             if (seen.has(real)) return; seen.add(real);
             let t=(a.getAttribute('title')||a.textContent||'').trim();
-            out.push({url: real, txt: t.slice(0,120), price: priceNear(a), ali: true});
+            let cand=[],n=a;
+            for(let i=0;i<4&&n;i++){if(n.querySelectorAll){cand.push(...n.querySelectorAll('img'));}n=n.parentElement;}
+            cand=cand.filter(im=>{const s=im.src||im.getAttribute('data-src')||'';return s&&!/favicon|faviconV2|sprite/i.test(s);});
+            cand.sort((p,q)=>((q.naturalWidth*q.naturalHeight)||(q.width*q.height)||0)-((p.naturalWidth*p.naturalHeight)||(p.width*p.height)||0));
+            const thumb=cand[0]?(cand[0].src||cand[0].getAttribute('data-src')||''):'';
+            out.push({url: real, txt: t.slice(0,120), price: priceNear(a), ali: true, img: thumb});
         } catch(e) {}
     });
     return out.slice(0, 20);
@@ -420,11 +437,64 @@ _ALI_PARSE_JS = r"""() => {
             if (!/aliexpress\./i.test(new URL(real).hostname) || !ITEM.test(real)) return;
             if (seen.has(real)) return; seen.add(real);
             let t=(a.getAttribute('title')||a.textContent||'').trim();
-            out.push({url: real, txt: t.slice(0,120), price: priceNear(a), ali: true});
+            let cand=[],n=a;
+            for(let i=0;i<4&&n;i++){if(n.querySelectorAll){cand.push(...n.querySelectorAll('img'));}n=n.parentElement;}
+            cand=cand.filter(im=>{const s=im.src||im.getAttribute('data-src')||'';return s&&!/favicon|faviconV2|sprite/i.test(s);});
+            cand.sort((p,q)=>((q.naturalWidth*q.naturalHeight)||(q.width*q.height)||0)-((p.naturalWidth*p.naturalHeight)||(p.width*p.height)||0));
+            const thumb=cand[0]?(cand[0].src||cand[0].getAttribute('data-src')||''):'';
+            out.push({url: real, txt: t.slice(0,120), price: priceNear(a), ali: true, img: thumb});
         } catch(e) {}
     });
     return out.slice(0, 20);
 }"""
+
+# ---- VERIFICATION PRECISION: hash perceptuel vignette resultat vs image Etsy ----------
+# Un "match" n'est valide que si la vignette du resultat AliExpress est VISUELLEMENT quasi
+# identique a l'image produit Etsy (distance de Hamming faible sur average-hash). Elimine
+# les faux positifs (le moteur image remonte un produit ressemblant mais different).
+# DESACTIVE par defaut: la verif par hash perceptuel (aHash) compare des PIXELS, mais la
+# photo AliExpress et la photo Etsy du MEME produit different (angle, fond, restyling du
+# dropshipper) => aHash donne des FAUX NEGATIFS systematiques. La precision vient deja du
+# matching VISUEL des moteurs (Google Lens / image-search AliExpress) qui utilisent des
+# deep-features robustes (crop/rotation) + filtrage AliExpress-only. Reactiver: ALI_VERIFY=1.
+VERIFY = _os.environ.get("ALI_VERIFY", "0") not in ("0", "false", "no")
+# GATING: si actif, un produit n'est "trouve" QUE si >=1 vignette passe le hash (precision
+# max, mais recall plus bas car les vignettes Lens sont des crops Google != photo Etsy).
+# Par defaut ADVISORY: on garde le match et on annote `verified` (les 2 signaux remontent
+# au score sans sacrifier le recall). Active le gating strict via ALI_VERIFY_GATE=1.
+VERIFY_GATE = _os.environ.get("ALI_VERIFY_GATE", "0") not in ("0", "false", "no")
+try: VERIFY_THRESH = int(_os.environ.get("ALI_VERIFY_THRESH", "18"))
+except Exception: VERIFY_THRESH = 18
+
+def _thumb_bytes(src):
+    if not src:
+        return None
+    if src.startswith("data:"):
+        try:
+            import base64
+            return base64.b64decode(src.split(",", 1)[1])
+        except Exception:
+            return None
+    return _download(src)
+
+def _verify_results(etsy_hash, results, thresh=VERIFY_THRESH, topn=5):
+    """Garde les resultats dont la vignette est ~identique a l'image Etsy. Si on ne peut pas
+    verifier (pas de hash Etsy, ou aucune vignette telechargeable), on NE filtre PAS (on ne
+    sacrifie pas le recall a cause d'une vignette manquante). Retourne (resultats_gardes, verifie?)."""
+    if etsy_hash is None:
+        return results, False
+    kept, any_thumb = [], False
+    for r in results[:topn]:
+        b = _thumb_bytes(r.get("img"))
+        if not b:
+            continue
+        any_thumb = True
+        h = _ahash(b)
+        if h is not None and _hamming(etsy_hash, h) <= thresh:
+            kept.append(r)
+    if not any_thumb:
+        return results, False           # aucune vignette comparable => pas de filtrage
+    return kept, True
 
 def _build_detail(title, results, src):
     """[{url,txt,price}] -> detail {ali,n,sim,src,ali_price?}. Classe par similarite titre.
@@ -448,14 +518,17 @@ async def _check_lens(pg, prod):
     imgs = [u for u in (prod.get("image_urls") or [prod.get("image_url")]) if u][:3]
     if not (TRY_IMAGE and imgs):
         return (False, "no_image", {})
-    # 1) Google Lens sur chaque image (arret au 1er hit)
+    # 1) Google Lens sur chaque image (arret au 1er hit VERIFIE)
     for img in imgs:
         try:
             results = await _lens_ali_search(pg, img)
         except Exception:
             results = []
         if results:
-            return (True, "image", _build_detail(title, results, "aliexpress"))
+            ok, vr = await _verified(img, results)
+            if ok:
+                d = _build_detail(title, ok, "aliexpress"); d["verified"] = vr
+                return (True, "image", d)
     # 2) Yandex sur chaque image (2e moteur, recall AliExpress superieur)
     if YANDEX_FALLBACK:
         for img in imgs:
@@ -464,8 +537,27 @@ async def _check_lens(pg, prod):
             except Exception:
                 ry = []
             if ry:
-                return (True, "yandex", _build_detail(title, ry, "aliexpress"))
+                ok, vr = await _verified(img, ry)
+                if ok:
+                    d = _build_detail(title, ok, "aliexpress"); d["verified"] = vr
+                    return (True, "yandex", d)
     return (False, "image", {"n": 0})
+
+async def _verified(img, results):
+    """Confronte les vignettes resultats a l'image Etsy `img` par hash perceptuel.
+    Retourne (resultats_a_utiliser, verified_bool).
+    - ADVISORY (defaut): garde TOUS les resultats, verified=True si >=1 vignette ~identique.
+    - GATING (ALI_VERIFY_GATE=1): ne garde QUE les vignettes ~identiques; [] si aucune
+      (=> pas de match) MAIS seulement quand des vignettes etaient comparables (sinon recall)."""
+    if not VERIFY:
+        return results, False
+    import asyncio as _a
+    eh = await _a.to_thread(lambda: _ahash(_download(img)))
+    kept, comparable = await _a.to_thread(_verify_results, eh, results)
+    verified = bool(comparable and kept)
+    if VERIFY_GATE and comparable:
+        return kept, verified           # strict: vignettes comparables => exige un match hash
+    return results, verified            # advisory: garde le recall, annote la confiance
 
 async def _check_native(pg, prod):
     """PHASE 2 (SERIE, pas en parallele sinon Datadome): recherche image NATIVE AliExpress
@@ -482,7 +574,10 @@ async def _check_native(pg, prod):
         except Exception:
             nat, blocked = None, False
         if nat:
-            return (True, "native", _build_detail(title, nat, "aliexpress_native"))
+            ok, vr = await _verified(img, nat)
+            if ok:
+                d = _build_detail(title, ok, "aliexpress_native"); d["verified"] = vr
+                return (True, "native", d)
         if not blocked:
             break                       # pas de captcha mais 0 resultat => 2e image inutile
     return (False, "image", {"n": 0})
