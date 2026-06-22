@@ -75,17 +75,17 @@
   <div class="card">
     <h2>1 · Source</h2>
     <select id="source">
+      <option value="live" selected>🌐 API live (1 crédit / boutique) — recommandé, fiable</option>
       <option value="cache">⚡ Base locale (0 requête, instantané)</option>
-      <option value="scrape">🕷️ Scraping navigateur (0 requête, lent)</option>
-      <option value="live">🌐 API live (1 crédit / boutique)</option>
+      <option value="scrape">🕷️ Scraping navigateur (0 crédit, lent + Etsy bloque 403 au volume)</option>
     </select>
     <div class="tip" id="src_hint"></div>
 
     <h2 style="margin-top:16px">2 · Combien de boutiques ?</h2>
-    <input id="target" type="number" value="100" min="1" max="1000">
+    <input id="target" type="number" value="15" min="1" max="1000">
     <div class="tip">Nombre exact voulu (max 1000). Marche pour les 3 modes.</div>
     <label>Min boutiques par niche <span class="i" title="Masque les niches qui ont moins de N boutiques (1 = tout afficher)">ⓘ</span></label>
-    <input id="min_per_niche" type="number" value="5" min="1" max="50">
+    <input id="min_per_niche" type="number" value="1" min="1" max="50">
     <div class="tip">Ex: 5 = n'affiche que les niches avec ≥5 boutiques. Astuce: mets un mot-clé de niche (ex « suncatcher ») pour avoir de la profondeur.</div>
 
     <h2 style="margin-top:16px">3 · Filtres boutique</h2>
@@ -93,8 +93,8 @@
     <input id="keyword" placeholder="ex: candle  ·  ou laisser vide">
 
     <div class="row">
-      <div style="flex:1"><label>Ventes/mois min <span class="i" title="Plus haut = boutiques qui cartonnent">ⓘ</span></label><input id="min_rate" type="number" value="5"></div>
-      <div style="flex:1"><label>Âge max (mois) <span class="i" title="Boutiques jeunes : 12 = moins d'1 an">ⓘ</span></label><input id="max_age" type="number" value="36"></div>
+      <div style="flex:1"><label>Ventes/mois min <span class="i" title="Plus haut = boutiques qui cartonnent">ⓘ</span></label><input id="min_rate" type="number" value="1"></div>
+      <div style="flex:1"><label>Âge max (mois) <span class="i" title="Boutiques jeunes : 12 = moins d'1 an. + haut = + de boutiques trouvées">ⓘ</span></label><input id="max_age" type="number" value="120"></div>
     </div>
 
     <details>
@@ -114,6 +114,7 @@
         <div class="chk"><input type="checkbox" id="ex_vintage" checked> Exclure vintage / revente</div>
         <div class="chk"><input type="checkbox" id="ex_heavy" checked> Exclure produits lourds</div>
         <div class="chk"><input type="checkbox" id="ex_custom"> Exclure boutiques "custom"</div>
+        <div class="chk"><input type="checkbox" id="only_cn_hk"> 🇨🇳 Que boutiques Chine/Hong Kong (+ de dropship)</div>
         <div class="chk"><input type="checkbox" id="fetch_titles" checked> Niche précise (catalogue complet, 2 crédits/boutique)</div>
         <div class="chk" style="padding-left:24px"><span class="tip" style="margin:0">Décoché = niche rapide depuis 1 titre (1 crédit/boutique, 2× plus de boutiques)</span></div>
         <div class="chk"><input type="checkbox" id="use_ai"> 🤖 Classement IA (si clé)</div>
@@ -121,8 +122,8 @@
         <div class="chk" style="padding-left:24px"><input type="checkbox" id="ali_gate" checked> Ne garder que les boutiques validées</div>
       </div>
       <div class="row">
-        <div style="flex:1"><label>Produits testés/boutique</label><input id="ali_products" type="number" value="10" min="1" max="20"></div>
-        <div style="flex:1"><label>Min produits trouvés</label><input id="ali_min_match" type="number" value="3" min="1" max="20"></div>
+        <div style="flex:1"><label>Produits testés/boutique</label><input id="ali_products" type="number" value="5" min="1" max="20"></div>
+        <div style="flex:1"><label>Min produits trouvés</label><input id="ali_min_match" type="number" value="2" min="1" max="20"></div>
       </div>
       <div class="tip">Gratuit (scrapling furtif, 0 crédit API). Recherche TEXTE sur AliExpress. ⚠️ AliExpress met parfois un CAPTCHA → statut "❔ bloqué" (boutique gardée). Lent (~5s/produit). Le bouton 🔴 reste dispo pour vérifier à la main.</div>
       <label>Catégories à exclure</label>
@@ -130,7 +131,25 @@
     </details>
 
     <button id="go" onclick="run()">🔍 Trouver des niches</button>
+    <button id="stop" class="sec" onclick="stopSearch()" style="display:none;background:#c0392b;color:#fff">⏹ Arrêter & garder les résultats</button>
     <button class="sec" onclick="exportCsv()">⬇ Export CSV</button>
+
+    <details style="margin-top:14px" open>
+      <summary>🧬 Boutiques similaires (clone finder)</summary>
+      <div class="tip">Colle le lien OU le nom d'une boutique Etsy. L'IA scanne TOUT son catalogue, déduit son type de produits, puis trouve d'autres boutiques vendant la même chose — produits trouvables sur AliExpress. Utilise les mêmes filtres ci-dessus.</div>
+      <input id="sim_shop" placeholder="ex: https://www.etsy.com/shop/NomBoutique  ·  ou  NomBoutique" style="margin-top:6px">
+      <div class="row" style="margin-top:6px">
+        <div style="flex:1"><label>Nb boutiques voulu</label><input id="sim_target" type="number" value="15" min="1" max="300"></div>
+        <div style="flex:1"><label>Ventes/mois min</label><input id="sim_min_rate" type="number" value="1" min="0"></div>
+      </div>
+      <label style="margin-top:6px">Mode</label>
+      <select id="sim_mode">
+        <option value="live">API Etsy (1 crédit/boutique, rapide)</option>
+        <option value="scrape">Scraping (0 crédit, navigateur, lent)</option>
+      </select>
+      <button id="simgo" onclick="similar()" style="margin-top:8px">🧬 Trouver boutiques similaires</button>
+      <button id="simstop" class="sec" onclick="stopSearch()" style="display:none;margin-top:6px;background:#c0392b;color:#fff">⏹ Arrêter & garder les résultats</button>
+    </details>
 
     <details style="margin-top:14px">
       <summary>Fiabiliser la base (API)</summary>
@@ -177,7 +196,7 @@ function params(){
     min_per_niche:val("min_per_niche"),
     validate_ali:chk("validate_ali"), ali_gate:chk("ali_gate"),
     ali_products:val("ali_products"), ali_min_match:val("ali_min_match"),
-    fetch_titles:chk("fetch_titles")
+    fetch_titles:chk("fetch_titles"), only_cn_hk:chk("only_cn_hk")
   });
 }
 async function quota(){try{const r=await(await fetch("/api/quota",{cache:"no-store"})).json();
@@ -196,7 +215,14 @@ function tbl(shops){
     if(hasAli){
       const via=s.ali_via?Object.keys(s.ali_via).join("/"):"";
       const icon=s.ali_blocked?"❔":(s.ali_validated?"✅":"❌");
-      aliCell=`<td>${icon} <span class="mut">${s.ali_blocked?"bloqué":(s.ali_hits??0)}${via?" ·"+via:""}</span></td>`;
+      let extra="";
+      if(s.ali_coverage!=null){extra+=` · ${Math.round(s.ali_coverage*100)}% trouvés`;}
+      const ap=s.ali_price_med??s.ali_price_min;
+      if(ap!=null){extra+=` · <b>$${ap}</b> AliE`;}
+      if(s.ali_margin_ratio!=null){extra+=` · ×${s.ali_margin_ratio} marge`;}
+      const sc=s.dropship_score100;
+      const scTag=sc!=null?` <b style="color:${sc>=60?'#2e7d32':sc>=35?'#e08600':'#999'}">${sc}/100</b>`:"";
+      aliCell=`<td>${icon}${scTag} <span class="mut">${s.ali_blocked?"bloqué":(s.ali_hits??0)}${via?" ·"+via:""}${extra}</span></td>`;
     }
     h+=`<tr>
       <td><a class="shop" href="${s.url}" target="_blank">${s.name||s.id}</a></td>
@@ -209,7 +235,14 @@ function tbl(shops){
   }
   return h+"</tbody></table>";
 }
-let _es=null;
+let _es=null,_sid=null;
+function newSid(){return "s"+Date.now()+Math.random().toString(36).slice(2,7);}
+function showStop(on){document.getElementById("stop").style.display=on?"block":"none";}
+function stopSearch(){
+  for(const id of ["stop","simstop"]){const b=document.getElementById(id);
+    if(b&&b.style.display!=="none"){b.disabled=true;b.innerHTML='<span class="spin"></span> Arrêt en cours…';}}
+  if(_sid){fetch("/api/stop?sid="+_sid).catch(()=>{});}  // serveur stoppe et renvoie le done partiel
+}
 function liveStat(matched,scanned,target){
   document.getElementById("stat").innerHTML=`
     <div><b style="color:var(--acc)">${matched}</b><span>boutiques trouvées / ${target}</span></div>
@@ -221,20 +254,20 @@ async function run(){
   const target=parseInt(val("target"))||0;
   if(_es){_es.close();_es=null;}
   liveStat(0,0,target);
+  function endBtns(){btn.disabled=false;btn.textContent="🔍 Trouver des niches";
+    showStop(false);const sb=document.getElementById("stop");sb.disabled=false;sb.innerHTML="⏹ Arrêter & garder les résultats";}
+  _sid=newSid();showStop(true);
   // flux temps reel: compteur de boutiques mis a jour en direct pendant la recherche
-  _es=new EventSource("/api/discover_stream?"+params());
+  _es=new EventSource("/api/discover_stream?"+params()+"&sid="+_sid);
   _es.onmessage=(ev)=>{
     let m;try{m=JSON.parse(ev.data);}catch(e){return;}
     if(m.type==="progress"){liveStat(m.matched,m.scanned,target);}
-    else if(m.type==="done"){_es.close();_es=null;render(m.result);
-      btn.disabled=false;btn.textContent="🔍 Trouver des niches";quota();}
+    else if(m.type==="done"){_es.close();_es=null;render(m.result);endBtns();quota();}
     else if(m.type==="error"){_es.close();_es=null;
-      document.getElementById("stat").innerHTML='<div class="empty">Erreur: '+m.error+'</div>';
-      btn.disabled=false;btn.textContent="🔍 Trouver des niches";}
+      document.getElementById("stat").innerHTML='<div class="empty">Erreur: '+m.error+'</div>';endBtns();}
   };
   _es.onerror=()=>{ if(_es){_es.close();_es=null;}
-    document.getElementById("stat").innerHTML='<div class="empty">Connexion interrompue. Relance la recherche.</div>';
-    btn.disabled=false;btn.textContent="🔍 Trouver des niches";};
+    document.getElementById("stat").innerHTML='<div class="empty">Connexion interrompue. Relance la recherche.</div>';endBtns();};
 }
 function render(r){
   let extra;
@@ -248,8 +281,65 @@ function render(r){
     ${extra}
     <div><b>${r.quota_remaining??"?"}</b><span>quota restant</span></div>`;
   const c=document.getElementById("clusters");
-  if(!r.clusters.length){c.innerHTML='<div class="empty">Aucune boutique. Assouplis les filtres (baisse ventes/mois, monte l’âge max).</div>';return;}
+  if(!r.clusters.length){c.innerHTML='<div class="empty">'+(r.notice?r.notice:'Aucune boutique. Assouplis les filtres (baisse ventes/mois, monte l’âge max).')+'</div>';return;}
   c.innerHTML=r.clusters.map((n,i)=>`<div class="niche">
+    <h3 onclick="const d=this.nextElementSibling;d.style.display=d.style.display==='none'?'block':'none'">
+      <span>📦 <b>${n.niche}</b></span><span class="pill">${n.count} boutiques</span></h3>
+    <div style="display:${i<3?'block':'none'}">${tbl(n.shops)}</div></div>`).join("");
+}
+// ----- BOUTIQUES SIMILAIRES -----
+function simParams(){
+  const p=params(); p.delete("source"); p.delete("keyword");
+  p.set("shop", val("sim_shop"));
+  p.set("mode", val("sim_mode"));
+  p.set("target_count", val("sim_target"));   // cible dediee clone finder
+  p.set("min_rate", val("sim_min_rate"));      // ventes/mois min dedie
+  return p;
+}
+async function similar(){
+  const shop=val("sim_shop").trim();
+  if(!shop){alert("Colle un lien ou un nom de boutique.");return;}
+  const btn=document.getElementById("simgo");btn.disabled=true;btn.innerHTML='<span class="spin"></span> Scan…';
+  const sstop=document.getElementById("simstop");
+  const target=parseInt(val("sim_target"))||0;
+  if(_es){_es.close();_es=null;}
+  document.getElementById("stat").innerHTML=`<div style="width:100%;color:var(--mut)"><span class="spin"></span> Scan du catalogue + recherche de boutiques similaires…</div>`;
+  document.getElementById("clusters").innerHTML="";
+  function endBtns(){btn.disabled=false;btn.innerHTML="🧬 Trouver boutiques similaires";
+    sstop.style.display="none";sstop.disabled=false;sstop.innerHTML="⏹ Arrêter & garder les résultats";}
+  _sid=newSid();sstop.style.display="block";
+  _es=new EventSource("/api/similar_stream?"+simParams()+"&sid="+_sid);
+  _es.onmessage=(ev)=>{
+    let m;try{m=JSON.parse(ev.data);}catch(e){return;}
+    if(m.type==="progress"){liveStat(m.matched,m.scanned,target);}
+    else if(m.type==="done"){_es.close();_es=null;renderSimilar(m.result);endBtns();quota();}
+    else if(m.type==="error"){_es.close();_es=null;
+      document.getElementById("stat").innerHTML='<div class="empty">Erreur: '+m.error+'</div>';endBtns();}
+  };
+  _es.onerror=()=>{ if(_es){_es.close();_es=null;}
+    document.getElementById("stat").innerHTML='<div class="empty">Connexion interrompue. Relance.</div>';endBtns();};
+}
+function renderSimilar(r){
+  if(r.error){document.getElementById("stat").innerHTML='<div class="empty">Erreur: '+r.error+'</div>';
+    document.getElementById("clusters").innerHTML="";return;}
+  const s=r.source||{}, p=r.profile||{};
+  document.getElementById("stat").innerHTML=`
+    <div><b>${r.matched}</b><span>similaires trouvées</span></div>
+    <div><b>${r.clusters.length}</b><span>niches</span></div>
+    <div><b style="color:var(--ok)">${r.api_used}</b><span>crédits API</span></div>
+    <div><b>${r.quota_remaining??"?"}</b><span>quota restant</span></div>`;
+  const c=document.getElementById("clusters");
+  if(r.stopped){document.getElementById("stat").insertAdjacentHTML("beforeend",
+    '<div style="width:100%;color:#c0392b">⏹ Recherche arrêtée — résultats partiels.</div>');}
+  const kw=(r.keywords||[]).map(k=>`<span class="pill">${k}</span>`).join(" ");
+  const head=`<div class="niche"><h3><span>🧬 Source: <b>${s.name||""}</b></span>
+      <span class="pill">${s.catalog||0} produits scannés</span></h3>
+    <div style="padding:6px 0;font-size:13px;color:var(--mut)">
+      ${p.summary?("« "+p.summary+" »<br>"):""}
+      Niche: <b>${p.niche||"?"}</b> · ${s.sold??"?"} ventes · ${s.rate??"?"}/mois · ${s.country||"?"}<br>
+      Mots-clés similarité: ${kw||"—"}</div></div>`;
+  if(!r.clusters.length){c.innerHTML=head+'<div class="empty">Aucune boutique similaire trouvée. Assouplis les filtres.</div>';return;}
+  c.innerHTML=head+r.clusters.map((n,i)=>`<div class="niche">
     <h3 onclick="const d=this.nextElementSibling;d.style.display=d.style.display==='none'?'block':'none'">
       <span>📦 <b>${n.niche}</b></span><span class="pill">${n.count} boutiques</span></h3>
     <div style="display:${i<3?'block':'none'}">${tbl(n.shops)}</div></div>`).join("");

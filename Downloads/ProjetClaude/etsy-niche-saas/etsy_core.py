@@ -12,20 +12,35 @@ Idee cle: l'endpoint listings/active renvoie deja, par produit (0 appel boutique
 Resultat : 1 appel listings = 100 produits filtres ; enrichissement cible
 => beaucoup plus de bonnes boutiques pour bien moins de credits.
 """
-import urllib.request, urllib.parse, urllib.error, json, time, os
+import urllib.request, urllib.parse, urllib.error, json, time, os, threading
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
+# ---- ANNULATION (bouton STOP): registre token -> Event. La recherche verifie ce
+# flag dans ses boucles et s'arrete proprement en RENVOYANT les resultats deja trouves. ----
+_CANCELS = {}
+def make_cancel(token):
+    ev = threading.Event(); _CANCELS[str(token)] = ev; return ev
+def cancel_search(token):
+    ev = _CANCELS.get(str(token))
+    if ev: ev.set()
+    return ev is not None
+def clear_cancel(token):
+    _CANCELS.pop(str(token), None)
+def _stopped(stop):
+    return bool(stop is not None and stop.is_set())
+
 ENRICH_WORKERS = 4      # appels API Etsy en parallele (+ retry 429 dans _get)
-AI_WORKERS = 4          # lots IA en parallele (failover gere par cle)
+AI_WORKERS = 8          # lots IA en parallele (failover gere par cle) — + de debit
 DAY_LIMIT_DEFAULT = 5000  # quota Etsy/jour par defaut (reset 00:00 UTC)
 
 # ---- IA optionnelle (OpenRouter). Modele GLM GRATUIT par defaut => 0 credit. ----
 # Cles + modele: variables d'env OU fichier local config.local.json (gitignore).
 # Plusieurs cles supportees => failover automatique (les modeles :free sont rate-limited).
 def _load_ai_config():
-    cfg = {"keys": [], "model": "", "anthropic": "", "etsy": ""}
+    cfg = {"keys": [], "model": "", "anthropic": "", "etsy": "",
+           "glm_key": "", "glm_model": "", "glm_base": ""}
     # 1) env
     env_or = os.environ.get("OPENROUTER_API_KEY", "")
     if env_or:
@@ -33,6 +48,9 @@ def _load_ai_config():
     cfg["model"] = os.environ.get("OPENROUTER_MODEL", "")
     cfg["anthropic"] = os.environ.get("ANTHROPIC_API_KEY", "")
     cfg["etsy"] = os.environ.get("ETSY_API_KEY", "")
+    cfg["glm_key"] = os.environ.get("GLM_API_KEY", "")
+    cfg["glm_model"] = os.environ.get("GLM_MODEL", "")
+    cfg["glm_base"] = os.environ.get("GLM_BASE", "")
     # 2) fichier local (n'ecrase pas l'env)
     p = Path(__file__).parent / "config.local.json"
     if p.exists():
@@ -44,6 +62,9 @@ def _load_ai_config():
             cfg["model"] = cfg["model"] or d.get("openrouter_model", "")
             cfg["anthropic"] = cfg["anthropic"] or d.get("anthropic_key", "")
             cfg["etsy"] = cfg["etsy"] or d.get("etsy_api_key", "")
+            cfg["glm_key"] = cfg["glm_key"] or d.get("glm_key", "")
+            cfg["glm_model"] = cfg["glm_model"] or d.get("glm_model", "")
+            cfg["glm_base"] = cfg["glm_base"] or d.get("glm_base", "")
         except Exception:
             pass
     return cfg
@@ -51,6 +72,10 @@ def _load_ai_config():
 _AICFG = _load_ai_config()
 OPENROUTER_KEYS = _AICFG["keys"]
 ANTHROPIC_KEY = _AICFG["anthropic"]
+# GLM direct (z.ai, OpenAI-compatible) — provider PRIORITAIRE si cle fournie.
+GLM_KEY = _AICFG["glm_key"]
+GLM_MODEL = _AICFG["glm_model"] or "z-ai/glm-5.2-free"
+GLM_BASE = (_AICFG["glm_base"] or "https://zenmux.ai/api/v1").rstrip("/")
 AI_MODEL = "claude-haiku-4-5-20251001"   # Anthropic direct (fallback)
 # Modeles GRATUITS OpenRouter (0 credit). gpt-oss-120b = meilleur dispo + JSON fiable.
 # Chaine de secours si rate-limit (429) sur les modeles :free.
@@ -59,12 +84,25 @@ OPENROUTER_FALLBACKS = ["openai/gpt-oss-20b:free", "meta-llama/llama-3.3-70b-ins
                         "qwen/qwen3-next-80b-a3b-instruct:free", "nvidia/nemotron-3-super-120b-a12b:free"]
 
 def ai_available():
-    return bool(OPENROUTER_KEYS or ANTHROPIC_KEY)
+    return bool(GLM_KEY or OPENROUTER_KEYS or ANTHROPIC_KEY)
 
 def ai_model_name():
+    if GLM_KEY: return GLM_MODEL
     if OPENROUTER_KEYS: return OPENROUTER_MODEL
     if ANTHROPIC_KEY: return AI_MODEL
     return ""
+
+def _glm_call(prompt, max_tokens):
+    """Appel GLM via ZenMux (OpenAI-compatible). temperature=0 => deterministe.
+    GLM 5.2 = reasoning model: les tokens de raisonnement sont decomptes de max_tokens
+    AVANT le contenu => on ajoute une marge (+4000) sinon le JSON ressort tronque/vide."""
+    budget = max_tokens + 4000
+    body = json.dumps({"model": GLM_MODEL, "max_tokens": budget, "temperature": 0,
+                       "messages": [{"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(GLM_BASE + "/chat/completions", data=body,
+        headers={"Authorization": "Bearer " + GLM_KEY, "content-type": "application/json"})
+    r = json.load(urllib.request.urlopen(req, timeout=120))
+    return r["choices"][0]["message"]["content"]
 
 def _openrouter_call(prompt, max_tokens, model, key):
     # temperature=0 => deterministe/precis (pas de creativite). top_p=1.
@@ -79,6 +117,11 @@ def _openrouter_call(prompt, max_tokens, model, key):
 def _ai_call(prompt, max_tokens=2000):
     """1 prompt -> texte. OpenRouter (GLM gratuit) avec failover entre cles + modele
     de secours. Fallback Anthropic direct si pas de cle OpenRouter. '' si echec."""
+    if GLM_KEY:                            # GLM prioritaire (le + performant)
+        try:
+            return _glm_call(prompt, max_tokens)
+        except Exception:
+            pass                            # echec GLM => bascule sur les fallbacks
     if OPENROUTER_KEYS:
         for model in [OPENROUTER_MODEL] + OPENROUTER_FALLBACKS:
             for key in OPENROUTER_KEYS:
@@ -132,17 +175,23 @@ def _ai_refine_chunk(chunk, query=""):
     en examinant ses titres UN PAR UN puis decide la niche majoritaire. Si `query`
     fournie, l'IA juge AUSSI la pertinence semantique vs la recherche (ex: 'support'
     = un support/socle, PAS 'emotional support')."""
-    items = [{"id": s["id"], "titres": (s.get("titles") or [s.get("sample", "")])[:40]}
+    items = [{"id": s["id"], "titres": (s.get("titles") or [s.get("sample", "")])[:60]}
              for s in chunk]
     rel_rule = ""
     rel_field = ""
     if query:
         rel_rule = (
-            "\nPERTINENCE RECHERCHE: l'utilisateur cherche le PRODUIT \"" + query + "\". "
-            "Comprends-le SEMANTIQUEMENT (le vrai objet voulu), pas comme une chaine de "
-            "caracteres. Ex: 'support' = un socle/support/presentoir physique, PAS "
-            "'emotional support'. 'bougie' = candle. Mets match=false si la boutique ne "
-            "vend pas majoritairement ce produit.\n"
+            "\nPERTINENCE RECHERCHE (CRITIQUE): l'utilisateur cherche \"" + query + "\". "
+            "Comprends cette recherche SEMANTIQUEMENT comme une CATEGORIE/THEME (le vrai "
+            "univers voulu), pas comme une chaine de caracteres. Ex: 'Kitchen & dining decor' "
+            "= univers cuisine/salle a manger (vaisselle, ustensiles, deco cuisine, textile "
+            "de table, rangement cuisine...). 'support' = un socle physique, PAS 'emotional "
+            "support'.\n"
+            "METHODE match: parcours TOUS les titres de la boutique, compte combien "
+            "appartiennent VRAIMENT a la categorie cherchee. match=true SEULEMENT si la "
+            "MAJORITE (>50%) des titres relevent de cette categorie/theme. Si la boutique "
+            "vend surtout autre chose (meme si 1-2 titres collent), match=false. Sois STRICT: "
+            "mieux vaut rejeter une boutique limite que polluer les resultats avec du hors-sujet.\n"
         )
         rel_field = "\"match\":true,"
     prompt = (
@@ -196,6 +245,30 @@ def _ai_refine_chunk(chunk, query=""):
             pass
     return out
 
+def _ai_sig(query, shop):
+    """Signature stable d'un verdict IA: depend de la recherche + des titres de la boutique.
+    Memes titres + meme query => meme verdict => reutilisable depuis le cache."""
+    import hashlib
+    titles = (shop.get("titles") or [shop.get("sample", "")])[:40]
+    base = (query or "").lower() + "|" + "|".join(sorted(t.lower() for t in titles if t))
+    return hashlib.md5(base.encode("utf-8", "replace")).hexdigest()
+
+def _ai_cache_path():
+    return CACHE / "ai_verdicts.json"   # CACHE defini plus bas => resolution a l'appel
+def _ai_cache_load():
+    try:
+        return json.loads(_ai_cache_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+def _ai_cache_save(d):
+    try:
+        # borne la taille (garde les 5000 derniers verdicts) pour ne pas grossir sans fin
+        if len(d) > 5000:
+            d = dict(list(d.items())[-5000:])
+        _ai_cache_path().write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
 def ai_refine(shops, batch=8, query=""):
     """Cerveau du logiciel. Decoupe en lots et les traite EN PARALLELE (gros gain
     vitesse, le failover de cles reste gere par lot). Par boutique:
@@ -207,13 +280,32 @@ def ai_refine(shops, batch=8, query=""):
     if not ai_available() or not shops:
         return {}
     pool = shops[:200]
-    chunks = [pool[i:i + batch] for i in range(0, len(pool), batch)]
-    out = {}
-    from functools import partial
-    work = partial(_ai_refine_chunk, query=query)
-    with ThreadPoolExecutor(max_workers=min(AI_WORKERS, len(chunks))) as ex:
-        for d in ex.map(work, chunks):
-            out.update(d)
+    # CACHE VERDICTS: l'IA donne le meme verdict pour une boutique tant que ses titres et
+    # la recherche n'ont pas change. On reutilise donc les verdicts deja calcules (persistes
+    # entre runs) => on n'appelle le LLM QUE sur les boutiques nouvelles/modifiees. Gros gain
+    # vitesse + 0 token gaspille a re-juger les memes boutiques.
+    vcache = _ai_cache_load()
+    out = {}; todo = []
+    for s in pool:
+        c = vcache.get(_ai_sig(query, s))
+        if c is not None:
+            out[s["id"]] = c
+        else:
+            todo.append(s)
+    if todo:
+        chunks = [todo[i:i + batch] for i in range(0, len(todo), batch)]
+        from functools import partial
+        work = partial(_ai_refine_chunk, query=query)
+        new = {}
+        with ThreadPoolExecutor(max_workers=min(AI_WORKERS, len(chunks))) as ex:
+            for d in ex.map(work, chunks):
+                new.update(d)
+        for s in todo:                          # indexe par sig pour les prochains runs
+            v = new.get(s["id"])
+            if v is not None:
+                out[s["id"]] = v
+                vcache[_ai_sig(query, s)] = v
+        _ai_cache_save(vcache)
     return out
 
 # Niche FR (taxonomie) -> mots-cles ANGLAIS pour la recherche Etsy/scrape. Etsy
@@ -269,6 +361,14 @@ FR_EN_WORD = {
     "jardin": "garden decor", "fete": "party decor", "gateau": "cake topper",
     "deco": "home decor", "decoration": "home decor", "murale": "wall decor", "maison": "home decor",
     "bijou": "necklace", "collier": "necklace", "boucle": "earrings", "bracelet": "bracelet",
+    # vegetal artificiel (Etsy = anglais): plante/fleur seules -> 'plant'/'flower',
+    # 'artificiel*'/'faux'/'fausse' -> 'faux' (mot-cle Etsy le plus courant pour le non-vivant)
+    "plante": "plant", "plantes": "plant", "fleur": "flower", "fleurs": "flower",
+    "artificiel": "faux", "artificielle": "faux", "artificiels": "faux", "artificielles": "faux",
+    "fausse": "faux", "fausses": "faux", "faux": "faux", "fauxplant": "faux plant",
+    "succulente": "succulent", "succulentes": "succulent", "bouquet": "bouquet",
+    "pampa": "pampas grass", "pampas": "pampas grass", "feuillage": "greenery",
+    "eucalyptus": "eucalyptus", "arbre": "tree", "arbres": "tree", "branche": "branch",
 }
 
 def resolve_keyword(kw):
@@ -308,17 +408,25 @@ def resolve_keyword(kw):
         return best, True
     return raw, False
 
-# Mots trop generiques pour servir de filtre de pertinence a eux seuls.
-_REL_GENERIC = {"decor", "home", "handmade", "gift", "set", "wall", "art", "deco", "custom"}
+# Deux niveaux de mots generiques:
+# - CORE: mots vraiment vides (home/decor/gift...) - ignores partout.
+# - TYPES: types de produit fourre-tout (organizer/holder/box/shelf...). Ils servent a
+#   mesurer la DOMINANCE catalogue (une boutique pleine de "pen holder/organizer" EST
+#   une boutique bureau) mais PAS comme pre-filtre (sinon une etagere "Wooden Organizer"
+#   passerait). Le pre-filtre exige le mot DISTINCTIF (ex "desk").
+_REL_GENERIC_CORE = {"decor", "home", "handmade", "gift", "set", "wall", "art", "deco", "custom"}
+_REL_GENERIC_TYPES = {"organizer", "organiser", "organize", "holder", "stand", "box", "boxes",
+    "storage", "tray", "rack", "shelf", "shelves", "mount", "sign", "case", "container",
+    "caddy", "kit", "accessory", "accessories", "office"}
+_REL_GENERIC = _REL_GENERIC_CORE | _REL_GENERIC_TYPES   # compat (pre-filtre distinctif)
 
 def keyword_relevance(titles, kw_en):
-    """Pertinence boutique vs mot-cle (traduit EN). = part des TITRES du catalogue
-    qui contiennent un mot-cle fort. Mesure la DOMINANCE: une boutique crochet avec
-    1 seul article 'wood' obtient ~0.02 (rejetee), une vraie boutique bois ~0.8.
-    Evite de retenir une boutique sur 1 produit isole matche par Etsy."""
+    """DOMINANCE catalogue: part des titres contenant un mot du mot-cle (types produit
+    INCLUS). Une boutique pleine de 'pen holder / desk organizer' score haut; une
+    boutique crochet avec 1 'desk' isole score bas. Ignore seulement les mots vides."""
     import re as _re
     toks = [w for w in _re.findall(r"[a-z]+", (kw_en or "").lower()) if len(w) > 2]
-    strong = [w for w in toks if w not in _REL_GENERIC] or toks
+    strong = [w for w in toks if w not in _REL_GENERIC_CORE] or toks
     if not strong or not titles:
         return 1.0
     low = [t.lower() for t in titles]
@@ -326,6 +434,7 @@ def keyword_relevance(titles, kw_en):
     return n / len(low)
 
 def _strong_tokens(kw_en):
+    """Mots DISTINCTIFS (types produit exclus) pour le pre-filtre precision (ex 'desk')."""
     import re as _re
     toks = [w for w in _re.findall(r"[a-z]+", (kw_en or "").lower()) if len(w) > 2]
     return [w for w in toks if w not in _REL_GENERIC] or toks
@@ -428,12 +537,19 @@ def ai_enrich_shops(shops, f):
       dropship-ables (produits trouvables sur AliExpress), seuil f['dropship_min'] (def 0.5)."""
     if not f.get("use_ai") or not ai_available() or not shops:
         return shops, False
-    query = (f.get("_query") or "").strip()    # mot-cle traduit EN => pertinence IA
+    # phrase BRUTE tapee par l'utilisateur (semantique fidele) sinon mot-cle traduit
+    query = (f.get("_query_raw") or f.get("_query") or "").strip()
     verdict = ai_refine(shops, query=query)
     if not verdict:
         return shops, False
     thr = float(f.get("dropship_min", 0.5))
     gate_ds = bool(f.get("ai_dropship_gate"))
+    # COUVERTURE: si l'IA a juge la majorite des boutiques, son verdict est fiable => on
+    # peut etre STRICT (une boutique sans verdict explicite de match est traitee comme
+    # hors-sujet quand un mot-cle est tape). Si l'IA a majoritairement echoue (peu de
+    # verdicts), on reste tolerant pour ne pas tout supprimer a tort.
+    coverage = len(verdict) / max(len(shops), 1)
+    strict = bool(query) and coverage >= 0.5
     kept = []
     # 1er passage: applique verdict + collecte les libelles libres par cle de regroupement
     canon_labels = {}                      # canon -> Counter(libelles bruts)
@@ -441,11 +557,15 @@ def ai_enrich_shops(shops, f):
     for s in shops:
         v = verdict.get(s["id"])
         if v is None:
-            kept.append(s); continue          # non juge => on garde
+            # pas de verdict: en mode STRICT (mot-cle + IA fiable) on JETTE (hors-sujet par
+            # defaut). Sinon on garde (l'IA n'a pas pu juger, on ne penalise pas).
+            if strict:
+                continue
+            kept.append(s); continue
         if not v.get("accept", True):
             continue                            # IA rejette: hors cible
-        if query and v.get("match") is False:
-            continue                            # IA: boutique hors-sujet vs la recherche
+        if query and v.get("match") is not True:
+            continue                            # match doit etre EXPLICITEMENT true (strict)
         raw = (str(v.get("niche") or "")).strip() or "Divers"
         key = niche_canon(raw) or raw.lower()
         canon_labels.setdefault(key, Counter())[raw] += 1
@@ -732,22 +852,28 @@ def fetch_shop_listing_ids(shop_id, n=10):
         return []
     return [str(L["listing_id"]) for L in d.get("results", []) if L.get("listing_id")][:n]
 
-def fetch_listing_images(listing_ids, per=1):
+def fetch_listing_images(listing_ids, per=1, with_prices=False):
     """1 appel batch: {listing_id: [image_urls]} pour jusqu'a 100 listings.
-    includes=Images embarque les images (url_570xN)."""
+    includes=Images embarque les images (url_570xN). Si with_prices=True, retourne
+    (images_dict, {listing_id: prix_float}) pour comparer au prix AliExpress (marge dropship)."""
     if not listing_ids:
-        return {}
+        return ({}, {}) if with_prices else {}
     try:
         b = _get("/listings/batch?listing_ids=" + ",".join(listing_ids[:100]) + "&includes=Images")
     except Exception:
-        return {}
-    out = {}
+        return ({}, {}) if with_prices else {}
+    out = {}; prices = {}
     for L in b.get("results", []):
+        lid = str(L.get("listing_id"))
         imgs = [im.get("url_570xN") or im.get("url_fullxfull") for im in (L.get("images") or [])]
         imgs = [u for u in imgs if u]
         if imgs:
-            out[str(L.get("listing_id"))] = imgs[:per]
-    return out
+            out[lid] = imgs[:per]
+        p = L.get("price") or {}
+        if p.get("divisor"):
+            try: prices[lid] = (p.get("amount", 0) or 0) / p["divisor"]
+            except Exception: pass
+    return (out, prices) if with_prices else out
 
 # ---------------- clustering (niche deduite) ----------------
 # Themes avec mots-cles SPECIFIQUES (evite faux positifs type "cat" qui matchait suncatcher).
@@ -1142,7 +1268,7 @@ def _sample_is_bad(sample, f):
         return True
     return False
 
-def run_scrape(keyword="", target_count=30, filters=None, progress=None):
+def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=None):
     """Scrape Etsy (navigateur, 0 credit API): trouve des boutiques, scrape TOUT leur
     catalogue (tous les titres), filtre et repartit par niche.
     Optimise: pre-filtre les samples (skip digital/banni avant de charger la boutique),
@@ -1154,7 +1280,12 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None):
     keyword, _kw_tr = resolve_keyword(keyword)   # nom de niche FR -> mots-cles EN
     f = filters or {}
     cache = _load()
-    shops = []; seen = set(); scraped = 0; found_total = 0; skipped_pre = 0; pg = 0
+    # CURSEUR PERSISTANT (reprise): chaque run de scrape repart la ou le precedent s'est
+    # arrete (par mot-cle) => on scanne de NOUVELLES pages au lieu de re-scraper page 1.
+    # Combine au cache qui accumule sans doublon => on atteint 1000 sur plusieurs runs.
+    scrape_ckey = "scrape:" + (keyword.strip().lower() or "_all")
+    pg = _cursor_get(scrape_ckey)
+    shops = []; seen = set(); scraped = 0; found_total = 0; skipped_pre = 0
 
     def keep(rec):
         titles = shop_titles(rec)
@@ -1176,19 +1307,55 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None):
                 "rate": round(d["sold"]/mo, 1), "active": 1, "digital_pct": 0,
                 "favorers": 0, "reviews": 0, "review_avg": None, "accepts_custom": None,
                 "sample": (d["titles"][0] if d["titles"] else sample),
-                "titles": d["titles"] or ([sample] if sample else [])}
+                "titles": d["titles"] or ([sample] if sample else []),
+                "images": d.get("images") or []}   # images produit scrapees (validation dropship sans API)
 
-    empty_streak = 0
-    # budget anti-boucle: au pire on charge ~15 boutiques par cible avant d'abandonner.
-    max_scraped = int(f.get("max_scraped", 0)) or max(target_count * 15, 200)
+    empty_streak = 0; nonew_streak = 0
+    # budget anti-boucle: au pire on charge ~25 boutiques par cible avant d'abandonner.
+    max_scraped = int(f.get("max_scraped", 0)) or max(target_count * 25, 400)
+    # Page vide = block Datadome transitoire. On retente 1 fois avec une courte pause, mais
+    # on ABANDONNE VITE (5 echecs) pour rendre les resultats deja trouves au lieu de faire
+    # patienter l'utilisateur ~4min. Avant: 12 echecs avec backoff jusqu'a 12s = trop long.
+    empty_limit = int(f.get("empty_streak_limit", 0)) or 3
+    # "plus de NOUVEAUX resultats": Etsy renvoie les MEMES boutiques (deja vues) => le stock
+    # pertinent est epuise. On coupe apres 3 paquets sans aucune nouvelle boutique => rend
+    # direct au lieu de scanner du vide.
+    nonew_limit = int(f.get("nonew_limit", 0)) or 3
+    # Nb de pages de recherche fetchees EN PARALLELE par tour (chacune ~48 boutiques).
+    # Gros gain vitesse: avant 1 page/tour avec attente ~4s bloquante. Plus haut = plus
+    # vite mais + de risque 403 Datadome => 5 est un bon compromis.
+    chunk = int(f.get("search_pages_chunk", 0)) or 5
+    PAGE_CAP = int(f.get("page_cap", 0) or 0) or max(250, target_count // 3 + 60)
     samples = {}   # name -> sample (pour le build)
-    # boucle jusqu'a target_count, epuisement Etsy, ou budget atteint.
-    while len(shops) < target_count and pg < 250 and scraped < max_scraped:
-        pg += 1
-        found = scraper.scrape_search_shops(keyword, pages=1, page_start=pg)
+    # SUR-ECHANTILLONNAGE (scrape = 0 credit => on peut en collecter large): l'IA et la
+    # validation AliExpress filtrent APRES la boucle. On collecte plus de candidats pour
+    # qu'il RESTE >= target_count boutiques EN NICHE apres filtrage.
+    gate_on = bool(f.get("use_ai", True) or f.get("validate_ali"))
+    collect_target = (target_count * 2 if gate_on else target_count)
+    # STAGNATION: si on scrape beaucoup SANS garder de nouvelle boutique (niche epuisee dans
+    # la fenetre courante OU Etsy bloque/reboucle), on s'arrete et on REND DIRECT au lieu de
+    # tourner en boucle. Plafond de boutiques scrapees depuis le dernier "keep".
+    # avec proxies le scraping est rapide + non bloque => on tolere plus de scan sans keep
+    # pour atteindre la cible (sinon on s'arrete trop tot sur une niche a faible rendement).
+    try:
+        import scraper as _scr; _has_proxies = bool(getattr(_scr, "_PROXIES", []))
+    except Exception:
+        _has_proxies = False
+    stall_limit = int(f.get("scrape_stall", 0)) or (300 if _has_proxies else 120)
+    scraped_at_last_keep = 0
+    # boucle jusqu'a collect_target, epuisement Etsy, ou budget atteint.
+    while len(shops) < collect_target and pg < PAGE_CAP and scraped < max_scraped and not _stopped(stop):
+        found = scraper.scrape_search_shops(keyword, pages=chunk, page_start=pg + 1)
+        pg += chunk
+        if not found:
+            # 1 seule courte pause + 1 retry. Si ca rebloque, on N'INSISTE PAS: on compte
+            # l'echec et on s'arrete vite (empty_limit bas) => bilan rendu IMMEDIATEMENT au
+            # lieu de faire patienter sur des proxies epuises/bloques.
+            time.sleep(2)
+            found = scraper.scrape_search_shops(keyword, pages=chunk, page_start=pg - chunk + 1)
         if not found:
             empty_streak += 1
-            if empty_streak >= 3: break   # 3 pages vides = fin du stock Etsy
+            if empty_streak >= empty_limit: break   # bloque => on rend ce qu'on a, direct
             continue
         empty_streak = 0
         found_total += len(found)
@@ -1201,7 +1368,13 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None):
                 skipped_pre += 1; continue
             samples[name] = sample
             batch.append(name)
-        if not batch: continue
+        # batch vide = que des dupes/filtrees = aucune NOUVELLE boutique => stock epuise.
+        # Apres nonew_limit paquets ainsi, on s'arrete et on rend les resultats direct.
+        if not batch:
+            nonew_streak += 1
+            if nonew_streak >= nonew_limit: break
+            continue
+        nonew_streak = 0
         # chargement PARALLELE du batch (1 navigateur, pool de pages)
         results = scraper.scrape_shops_batch(batch)
         for name in batch:
@@ -1209,13 +1382,45 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None):
             rec = build(name, samples.get(name, ""), results.get(name, {}))
             if rec is None: continue
             cache_upsert(cache, rec)   # enregistre toute boutique trouvee, sans doublon
-            if keep(rec): shops.append(rec)
+            if keep(rec):
+                shops.append(rec); scraped_at_last_keep = scraped
             if progress: progress(len(shops), scraped)
-            if len(shops) >= target_count: break
+            if len(shops) >= collect_target: break
         _save(cache)
+        # stagnation: trop de boutiques scrapees depuis le dernier keep => on rend direct.
+        if scraped - scraped_at_last_keep >= stall_limit:
+            break
+    # memorise ou on s'est arrete pour REPRENDRE au prochain run (pages suivantes).
+    # Si on a depasse le stock Etsy (~PAGE_CAP), on reboucle au debut.
+    _cursor_set(scrape_ckey, 0 if pg >= PAGE_CAP else pg)
     shops.sort(key=lambda x: -x["rate"])
+    # raffinage IA: l'IA lit TOUS les titres de fiches produit de chaque boutique
+    # (deja scrapes dans rec["titles"]) et DEDUIT le nom de niche depuis les titres
+    # majoritaires (ex: beaucoup de titres "fleurs" => niche "Plantes & fleurs").
+    # Sans ca, le scrape retombait sur le clustering mot-cle => tout en "Autre deco maison".
+    if "_query" not in f:
+        f["_query"] = _kw_tr or keyword
+    if keyword.strip():
+        f.setdefault("_query_raw", keyword.strip())   # phrase brute => match semantique fidele
+    ai_used = False
+    if f.get("use_ai", True) and ai_available() and shops:
+        shops, ai_used = ai_enrich_shops(shops, f)
+    # validation dropship AliExpress (opt-in), comme en mode discovery
+    ali_used = False
+    if f.get("validate_ali") and shops:
+        ali_used = True
+        nprod = int(f.get("ali_products", 10) or 10)
+        minm = int(f.get("ali_min_match", 2) or 2)
+        validate_shops_ali(shops, nprod, minm, stop=stop)
+        if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
+            # CONSENSUS: on ne garde que les boutiques ou Lens A TROUVE les produits sur
+            # AliExpress ET (si l'IA a juge) ou l'IA estime le produit revendable. Coupe les
+            # faux positifs (Lens a remonte un lien hasardeux mais produit pas vraiment sourcable).
+            shops = [s for s in shops if (s.get("dropship_confirmed")
+                     if s.get("dropship_confirmed") is not None else s.get("ali_validated"))]
     res = {"source": "scrape", "api_used": 0, "scraped": scraped,
            "found": found_total, "skipped_pre": skipped_pre, "matched": len(shops),
+           "ai_used": ai_used, "ali_used": ali_used, "ai_available": ai_available(),
            "quota_remaining": _remaining["today"], "clusters": [], "shops": shops}
     # coupe a EXACTEMENT target_count + diversifie les niches
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
@@ -1253,7 +1458,7 @@ def export_csv(filters=None, keyword=""):
     return "\n".join(rows)
 
 # ---------------- pipeline efficace ----------------
-def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progress=None):
+def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progress=None, stop=None):
     """
     Cherche jusqu'a `target_count` bonnes boutiques. Boucle sur les pages de
     nouveautes (sort_on=created => produits recents => boutiques jeunes), filtre
@@ -1277,8 +1482,23 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     listing_calls = 0; kept_listings = 0; seen_listings = 0; enriched_calls = 0
     # pertinence: le catalogue de la boutique doit correspondre au mot-cle (deja traduit EN)
     kw_rel = keyword.strip().lower()
-    rel_min = float(f.get("relevance_min", 0.35)) if kw_rel else 0.0
+    # gate dominance 0.35: le catalogue doit etre MAJORITAIREMENT sur le mot distinctif
+    # (ex "desk") pour que la niche soit COHERENTE avec la recherche. A 0.2 trop de
+    # boutiques hors-sujet passaient ("organisateur divers", "marqueurs" quand on cherche
+    # "desk"). Compromis assume: precision > quantite (on perd quelques boutiques desk
+    # eparses, mais on ne renvoie plus de niches incoherentes). Ajustable via relevance_min.
+    rel_min = float(f.get("relevance_min", 0.25)) if kw_rel else 0.0
+    rel_strong = _strong_tokens(kw_rel) if kw_rel else []   # mots distinctifs (pre-filtre gratuit)
     f["_query"] = kw_rel         # pertinence IA (jugement semantique vs la recherche)
+    f["_query_raw"] = (keyword or "").strip()   # phrase brute tapee (semantique fidele)
+    # AUTO-IA SUR MOT-CLE: si un mot-cle est tape et qu'une cle IA est dispo, on ACTIVE
+    # le jugement IA meme si la case n'est pas cochee. Le filtre mot-cle deterministe est
+    # souple (laisse passer des boutiques limites); l'IA, elle, LIT TOUT le catalogue de
+    # chaque boutique et tranche si ca correspond vraiment a la recherche => coherence.
+    # (Le cache de verdicts rend les runs suivants quasi-instantanes.)
+    if kw_rel and ai_available() and not f.get("use_ai"):
+        f["use_ai"] = True
+        f.setdefault("_ai_auto", True)
     # ROTATION: chaque run repart la ou le precedent s'est arrete (par mot-cle) =>
     # on scanne de NOUVELLES pages de nouveautes => on ne retombe plus toujours sur
     # les memes boutiques / memes niches.
@@ -1291,8 +1511,20 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         start_pg = 0          # on reboucle au debut
     pg = start_pg
     exhausted = False; reset_tried = False; fail_streak = 0
-    while len(shops) < target_count and pg < start_pg + 120 and pg < MAX_PAGE + 5 \
-          and (listing_calls + enriched_calls) < max_api:
+    # ANTI-GASPILLAGE credits: si on a deja depense un gros budget SANS trouver une
+    # seule boutique (filtres trop stricts / mot-cle sans jeunes boutiques), inutile
+    # de cramer les 500 credits => on s'arrete tot et on previent l'utilisateur.
+    no_match_budget = int(f.get("no_match_budget", 0)) or min(max_api, 150)
+    aborted_no_match = False
+    last_match_credits = 0   # credits depenses au moment de la derniere boutique gardee
+    # SUR-ECHANTILLONNAGE: l'IA (match) et la validation AliExpress filtrent APRES la boucle.
+    # Pour qu'il RESTE >= target_count boutiques EN NICHE apres ce filtrage, on collecte plus
+    # de candidats quand un gate est actif (sinon on collecte target et le gate en jette =>
+    # resultat final < target). Additif + borne pour ne pas exploser les credits.
+    gate_on = bool(f.get("use_ai") or f.get("validate_ali"))
+    collect_target = min(target_count * 4, target_count + 25) if gate_on else target_count
+    while len(shops) < collect_target and pg < start_pg + 120 and pg < MAX_PAGE + 5 \
+          and (listing_calls + enriched_calls) < max_api and not _stopped(stop):
         q = f"?limit=100&offset={pg*100}&sort_on=created&sort_order=down"
         if keyword.strip(): q += "&keywords=" + urllib.parse.quote(keyword.strip())
         try:
@@ -1323,6 +1555,14 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
             seen_listings += 1
             ok, _ = classify_listing(L, opts)        # filtre produit GRATUIT
             if not ok: continue
+            # PRE-FILTRE PERTINENCE GRATUIT: le mot-cle search d'Etsy est flou (il matche
+            # large). Avant de payer 1 credit pour enrichir la boutique, on exige que le
+            # titre du produit qui a matche contienne le mot DISTINCTIF (ex "desk"). Coupe
+            # les boutiques hors-sujet (etageres, boites bois...) AVANT de cramer le credit
+            # => meilleur ratio + resultats vraiment lies a la recherche.
+            title_l = (L.get("title") or "").lower()
+            if rel_strong and not any(w in title_l for w in rel_strong):
+                continue
             kept_listings += 1
             sid = str(L.get("shop_id") or "")
             if not sid or sid in processed: continue
@@ -1355,6 +1595,11 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
             if rec["sold"] < f.get("min_sold", 0): continue
             if f.get("exclude_digital", True) and rec["digital_pct"] >= 50: continue
             if f.get("exclude_custom_shops") and rec.get("accepts_custom"): continue
+            # Astuce dropship: boutiques localisees en Chine/Hong Kong revendent souvent
+            # des produits AliExpress => filtrer dessus AVANT Lens augmente fortement le
+            # taux de validation et evite de cramer Lens sur des boutiques non-sourcables.
+            if f.get("only_cn_hk") and (rec.get("country") or "").upper() not in ("CN", "HK"):
+                continue
             keep_recs.append(rec)
         # 4) catalogues (titres) en PARALLELE -> niche precise
         if f.get("fetch_titles", True):
@@ -1378,8 +1623,14 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
             if kw_rel:                     # affiche un produit qui matche le mot-cle
                 rec = dict(rec); rec["sample"] = match_sample(shop_titles(rec), kw_rel)
             shops.append(rec)
+            last_match_credits = listing_calls + enriched_calls   # progres => on continue
             if progress: progress(len(shops), seen_listings)
-            if len(shops) >= target_count: break
+            if len(shops) >= collect_target: break
+        # early-abort anti-gaspillage: aucun NOUVEAU resultat depuis no_match_budget
+        # credits (0 boutique au depart, OU filon epuise apres en avoir trouve quelques-unes).
+        if (listing_calls + enriched_calls) - last_match_credits >= no_match_budget:
+            aborted_no_match = True
+            break
     # avance le curseur de pagination pour le prochain run (rotation des niches).
     # epuise ou peu de pages => on recommence du debut la prochaine fois.
     _cursor_set(ckey, 0 if exhausted else pg)
@@ -1393,10 +1644,12 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         ali_used = True
         nprod = int(f.get("ali_products", 10) or 10)
         minm = int(f.get("ali_min_match", 3) or 3)
-        enriched_calls += validate_shops_ali(shops, nprod, minm)
-        # gate seulement si AliExpress n'a PAS bloque (sinon on garderait 0 boutique)
-        if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops):
-            shops = [s for s in shops if s.get("ali_validated")]
+        enriched_calls += validate_shops_ali(shops, nprod, minm, stop=stop)
+        # gate seulement si AliExpress n'a PAS bloque (sinon on garderait 0 boutique).
+        # CONSENSUS Lens+IA (dropship_confirmed) pour couper les faux positifs.
+        if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
+            shops = [s for s in shops if (s.get("dropship_confirmed")
+                     if s.get("dropship_confirmed") is not None else s.get("ali_validated"))]
     res = {
         "listing_calls": listing_calls,
         "shop_calls": enriched_calls,
@@ -1409,10 +1662,226 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         "candidates": len(candidates),
         "matched": len(shops),
         "quota_remaining": _remaining["today"],
+        "aborted_no_match": aborted_no_match,
         "clusters": [],
         "shops": shops,
     }
+    if aborted_no_match:
+        res["notice"] = ("Arret anticipe apres %d credits (%d boutique(s) trouvee(s)): plus "
+                         "de nouveau resultat pour ce mot-cle avec ces filtres. Assouplis "
+                         "(baisse ventes/mois min, monte age max) ou change de mot-cle. "
+                         "Credits economises." % (listing_calls + enriched_calls, len(shops)))
     # coupe a EXACTEMENT target_count + diversifie les niches
+    return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
+
+# ---------------- boutiques similaires (scan + clones) ----------------
+def resolve_shop_name(text):
+    """Extrait le NOM de boutique Etsy d'un lien OU d'un nom brut.
+    Gere: https://www.etsy.com/shop/NOM, /fr/shop/NOM, lien produit .../shop/NOM,
+    ou simplement 'Mon Shop' -> 'MonShop'."""
+    import re as _re
+    s = (text or "").strip()
+    if not s:
+        return ""
+    m = _re.search(r"etsy\.[a-z.]+/(?:[a-z]{2}/)?shop/([A-Za-z0-9_-]+)", s, _re.I)
+    if m:
+        return m.group(1)
+    m = _re.search(r"/shop/([A-Za-z0-9_-]+)", s)
+    if m:
+        return m.group(1)
+    if s.lower().startswith("http"):
+        # lien sans /shop/ : on tente le dernier segment alphanumerique
+        seg = [p for p in _re.split(r"[/?#]", s) if _re.fullmatch(r"[A-Za-z0-9_-]+", p)]
+        if seg:
+            return seg[-1]
+    return _re.sub(r"\s+", "", s)   # nom de boutique Etsy = sans espaces
+
+def lookup_shop(name):
+    """Trouve une boutique Etsy par nom (API findShops) puis scanne son catalogue
+    COMPLET (jusqu'a 100 titres). Retourne le record enrichi + titles, ou {error}."""
+    if not name:
+        return {"error": "Entre un nom ou lien de boutique."}
+    try:
+        d = _get("/shops?shop_name=" + urllib.parse.quote(name))
+    except Exception as e:
+        return {"error": "Etsy: " + str(e)[:80]}
+    results = d.get("results", [])
+    if not results:
+        return {"error": "Boutique introuvable: " + name}
+    m = None
+    for r in results:                       # match exact prioritaire
+        if (r.get("shop_name") or "").lower() == name.lower():
+            m = r; break
+    m = m or results[0]
+    sid = m.get("shop_id")
+    rec = _fetch_shop_record(sid)
+    if rec.get("error"):
+        return rec
+    rec["titles"] = fetch_shop_titles(sid, 100)
+    rec["sample"] = rec["titles"][0] if rec.get("titles") else ""
+    return rec
+
+def ai_shop_profile(titles, name=""):
+    """L'IA scanne le catalogue COMPLET d'une boutique et en deduit un profil PRECIS:
+    niche dominante + types de produits + 1-3 mots-cles ANGLAIS de recherche Etsy pour
+    trouver des boutiques SIMILAIRES (meme type de produit). {} si pas de cle IA."""
+    if not ai_available() or not titles:
+        return {}
+    items = titles[:100]
+    prompt = (
+        "Tu es un AGENT expert d'analyse de boutiques Etsy pour un dropshipper. On te donne "
+        "la LISTE COMPLETE des titres produits d'UNE boutique" + (" (" + name + ")" if name else "") + ".\n\n"
+        "Prends ton TEMPS. Lis ABSOLUMENT TOUS les titres un par un. Identifie le ou les "
+        "TYPES DE PRODUITS reellement vendus et le THEME/univers de la boutique.\n\n"
+        "Objectif: produire des MOTS-CLES de recherche Etsy (EN ANGLAIS) qui permettront de "
+        "retrouver d'AUTRES boutiques vendant LE MEME genre de produits.\n\n"
+        "Renvoie UNIQUEMENT ce JSON compact, rien d'autre:\n"
+        "{\"niche\":\"<niche dominante en francais, 2-4 mots, par le PRODUIT>\","
+        "\"product_types\":[\"<type produit 1 en anglais>\",\"<type 2>\"],"
+        "\"keywords\":[\"<mot-cle recherche Etsy EN, 1-3 mots>\",\"<autre>\",\"<autre>\"],"
+        "\"dropship\":<0..1 proba produits industriels revendables sur AliExpress>,"
+        "\"summary\":\"<1 phrase: ce que vend la boutique>\"}\n"
+        "REGLES keywords: 1 a 3 max, en ANGLAIS, termes que les vendeurs Etsy utilisent "
+        "VRAIMENT (ex 'macrame wall hanging', 'ceramic mug', 'dog bandana'). Du plus dominant "
+        "au moins dominant. PAS de marque, PAS de nom de boutique, PAS de mot generique seul "
+        "('home decor', 'gift', 'handmade').\n\n"
+        + json.dumps(items, ensure_ascii=False)
+    )
+    txt = _ai_call(prompt, max_tokens=1200)
+    if not txt:
+        return {}
+    try:
+        txt = txt[txt.find("{"): txt.rfind("}") + 1]
+        p = json.loads(txt)
+        p["keywords"] = [str(k).strip() for k in (p.get("keywords") or []) if str(k).strip()][:3]
+        p["product_types"] = [str(k).strip() for k in (p.get("product_types") or []) if str(k).strip()][:5]
+        return p
+    except Exception:
+        return {}
+
+def _scan_shop_scrape(name):
+    """Scan le catalogue COMPLET d'une boutique via SCRAPING (0 credit API).
+    Retourne un record similaire a lookup_shop, ou {error}."""
+    import scraper
+    if not scraper.SCRAPLING_OK:
+        return {"error": "scrapling non installe"}
+    d = scraper.scrape_shop(name)
+    if d.get("error") or d.get("sold") is None:
+        return {"error": d.get("error") or ("boutique introuvable: " + name)}
+    mo = d.get("months") or 12
+    return {"id": name, "name": name, "url": "https://www.etsy.com/shop/" + name,
+            "country": None, "sold": d["sold"], "months": mo,
+            "rate": round(d["sold"] / mo, 1),
+            "titles": d.get("titles") or [], "images": d.get("images") or [],
+            "sample": (d["titles"][0] if d.get("titles") else "")}
+
+def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None,
+                       mode="live", progress=None, stop=None):
+    """Colle un lien/nom de boutique -> scan complet -> trouve des boutiques SIMILAIRES
+    (meme type de produits) avec produits trouvables sur AliExpress.
+
+    mode="live"   : source + candidats via API Etsy (run_discovery). 1 credit/boutique.
+    mode="scrape" : source + candidats via navigateur (run_scrape). 0 credit API.
+
+    Pipeline:
+      1. scan catalogue complet de la source (API ou scrape selon mode).
+      2. ai_shop_profile                  -> niche + mots-cles EN precis.
+      3. run_discovery/run_scrape par mot-cle -> candidats (filtre IA match + AliExpress).
+      4. fusion/dedup, retrait de la boutique source, finalize.
+    """
+    f = dict(filters or {})
+    # CLONE FINDER = trouver des boutiques DROPSHIP-ables: la verif AliExpress est le
+    # COEUR de la feature, on la FORCE (peu importe la case UI). Les produits des
+    # boutiques similaires DOIVENT exister sur AliExpress.
+    f["validate_ali"] = True
+    f.setdefault("ali_gate", True)        # ne garder que les boutiques validees
+    f["use_ai"] = True                     # jugement IA dropship (consensus avec Lens)
+    scrape_mode = (mode == "scrape")
+    name = resolve_shop_name(shop_input)
+    src = _scan_shop_scrape(name) if scrape_mode else lookup_shop(name)
+    if src.get("error"):
+        return {"error": src["error"], "shops": [], "clusters": []}
+    titles = src.get("titles") or []
+    if progress:
+        progress(0, len(titles))   # signale: scan source fait
+    profile = ai_shop_profile(titles, src.get("name"))
+    kws = list(profile.get("keywords") or [])
+    if not kws:                              # fallback sans IA: nom de niche du catalogue
+        raw, _ = auto_niche(titles)
+        kws = [raw.lower()]
+    src_id = str(src.get("id"))
+    src_nm = (src.get("name") or "").lower()
+    seen = {}
+    merged = []
+    api_used = 0
+    listing_calls = 0
+    ai_used = False; ali_used = False
+    # cible sur-echantillonnee par mot-cle (les filtres IA/Ali coupent ensuite)
+    per_target = max(target_count, 20)
+    # MODE API "INSISTANT": on ne s'arrete PAS tant que la cible (target_count) n'est pas
+    # atteinte. On rejoue les mots-cles en PLUSIEURS tours; le curseur de pagination de
+    # run_discovery repart a chaque tour sur de NOUVELLES pages => on ne re-scanne pas les
+    # memes boutiques. On desactive l'early-abort (no_match_budget tres haut). Garde-fou:
+    # max_rounds + plafond de credits pour ne pas tourner a l'infini si le filon est vide.
+    f["no_match_budget"] = 10 ** 9          # desactive l'arret anticipe "plus de resultat"
+    per_budget = max(200, max_api // max(len(kws), 1))
+    max_rounds = int(f.get("similar_max_rounds", 0)) or (12 if not scrape_mode else 4)
+
+    def absorb(sub):
+        nonlocal api_used, listing_calls, ai_used, ali_used
+        api_used += sub.get("api_used", 0)
+        listing_calls += sub.get("listing_calls", 0)
+        ai_used = ai_used or sub.get("ai_used", False)
+        ali_used = ali_used or sub.get("ali_used", False)
+        added = 0
+        for s in sub.get("shops", []):
+            sid = str(s.get("id"))
+            if sid == src_id or (s.get("name") or "").lower() == src_nm:
+                continue                    # jamais la boutique source elle-meme
+            if sid in seen:
+                continue
+            seen[sid] = s; merged.append(s); added += 1
+        return added
+
+    rnd = 0
+    while len(merged) < target_count and rnd < max_rounds and not _stopped(stop):
+        rnd += 1
+        round_added = 0
+        for kw in kws:
+            if len(merged) >= target_count or _stopped(stop):
+                break
+            if scrape_mode:
+                sub = run_scrape(keyword=kw, target_count=per_target,
+                                 filters=dict(f), progress=progress, stop=stop)
+            else:
+                sub = run_discovery(keyword=kw, target_count=per_target,
+                                    max_api=per_budget, filters=dict(f), progress=progress, stop=stop)
+            round_added += absorb(sub)
+            if progress: progress(len(merged), 0)
+        if round_added == 0:                # un tour entier sans NOUVELLE boutique => filon epuise
+            break
+    merged.sort(key=lambda x: -x.get("rate", 0))
+    res = {
+        "source": {
+            "id": src_id, "name": src.get("name"), "url": src.get("url"),
+            "country": src.get("country"), "sold": src.get("sold"),
+            "rate": src.get("rate"), "months": src.get("months"),
+            "catalog": len(titles), "sample_titles": titles[:8],
+        },
+        "profile": profile,
+        "keywords": kws,
+        "ai_used": ai_used,
+        "ali_used": ali_used,
+        "ai_available": ai_available(),
+        "api_used": api_used,
+        "listing_calls": listing_calls,
+        "matched": len(merged),
+        "quota_remaining": _remaining["today"],
+        "stopped": _stopped(stop),
+        "rounds": rnd,
+        "clusters": [],
+        "shops": merged,
+    }
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
 
 # ---------------- validation dropship AliExpress ----------------
@@ -1458,7 +1927,7 @@ def _ali_text_validate(shops, nprod, min_match, sim_thresh):
         s["ali_matches"] = matches
         s["ali_validated"] = None if blocked else (hits >= min_match)
 
-def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=True):
+def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=True, stop=None):
     """Verifie si les produits d'une boutique existent A L'IDENTIQUE sur AliExpress.
 
     use_image=True (defaut): recupere les VRAIES images produit de la boutique (Etsy API,
@@ -1469,34 +1938,105 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
     Boutique validee si >= min_match produits trouves identiques. ali_blocked si captcha.
     Renvoie le nombre d'appels API Etsy consommes (images)."""
     api = 0
-    if use_image:
-        try:
-            import ali_image
-            if not getattr(ali_image, "PATCHRIGHT_OK", False):
-                use_image = False   # navigateur image indispo => texte (scrapling)
-        except Exception:
-            use_image = False
-    if not use_image:
-        _ali_text_validate(shops, nprod, min_match, sim_thresh)
+    # Validation UNIQUEMENT par image (Google Lens). On ne scrape PLUS AliExpress en
+    # texte: ca declenche "trafic exceptionnel"/captcha Datadome. Si le navigateur Lens
+    # est indispo, on n'a pas de verdict (ali_validated=None) plutot que de taper AliExpress.
+    ok = False
+    try:
+        import ali_image
+        ok = bool(getattr(ali_image, "PATCHRIGHT_OK", False))
+    except Exception:
+        ok = False
+    if not ok:
+        for s in shops:
+            s["ali_hits"] = 0; s["ali_via"] = {}; s["ali_blocked"] = False
+            s["ali_matches"] = []; s["ali_validated"] = None
         return 0
     for s in shops:
+        if _stopped(stop):
+            # STOP demande: les boutiques non encore testees restent sans verdict (None)
+            s.setdefault("ali_validated", None); s.setdefault("ali_hits", 0)
+            s.setdefault("ali_blocked", False); s.setdefault("ali_matches", [])
+            continue
         titles = (s.get("titles") or [s.get("sample", "")])[:nprod]
-        # images produit reelles -> recherche image AliExpress (match identique)
-        ids = fetch_shop_listing_ids(s["id"], n=nprod)
-        if ids: api += 1
-        imgs = fetch_listing_images(ids, per=1) if ids else {}
-        if imgs: api += 1
-        img_list = [u for lst in imgs.values() for u in lst]
-        products = [{"title": t, "image_url": (img_list[i] if i < len(img_list) else None)}
+        # Source des images produit:
+        # - MODE SCRAPE: le scraper a deja recupere les images de la page boutique
+        #   (s["images"], alignees sur s["titles"]) => 0 appel API Etsy.
+        # - MODE API/DISCOVERY: pas d'images scrapees => on les recupere via l'API Etsy
+        #   (id numerique de boutique requis). Si s["id"] n'est pas numerique (scrape),
+        #   l'appel API echouerait => on ne le tente QUE si pas d'images scrapees ET id numerique.
+        scraped_imgs = [u for u in (s.get("images") or []) if u]
+        # prod_imgs = liste alignee aux titres, chaque element = liste de 1-2 images du
+        # MEME produit (2e image = 2e chance de match AliExpress si la 1re rate).
+        if scraped_imgs:
+            prod_imgs = [[u] for u in scraped_imgs[:nprod]]
+        elif str(s.get("id", "")).isdigit():
+            ids = fetch_shop_listing_ids(s["id"], n=nprod)
+            if ids: api += 1
+            # per=3 => 3 photos/produit (memes tri score => ordre aligne aux titres). Plus
+            # d'images = plus de chances que Lens relie une des vues a une URL AliExpress.
+            imgs, eprices = fetch_listing_images(ids, per=3, with_prices=True) if ids else ({}, {})
+            if imgs: api += 1
+            prod_imgs = [imgs[lid] for lid in ids if lid in imgs]
+            # prix Etsy le plus bas du lot teste => base de la marge dropship
+            if eprices and s.get("price") is None:
+                s["price"] = round(min(eprices.values()), 2)
+        else:
+            prod_imgs = []
+        products = [{"title": t,
+                     "image_url": (prod_imgs[i][0] if i < len(prod_imgs) and prod_imgs[i] else None),
+                     "image_urls": (prod_imgs[i] if i < len(prod_imgs) else [])}
                     for i, t in enumerate(titles) if t]
         if not products:
             s["ali_hits"] = 0; s["ali_via"] = {}; s["ali_blocked"] = False
             s["ali_matches"] = []; s["ali_validated"] = None
             continue
-        r = ali_image.validate_shop(products, min_match=min_match, sim_thresh=sim_thresh)
+        r = ali_image.validate_shop(products, min_match=min_match, sim_thresh=sim_thresh,
+                                    test_all=True)
         s["ali_hits"] = r.get("hits", 0)
         s["ali_via"] = r.get("via", {})
         s["ali_blocked"] = bool(r.get("blocked"))
         s["ali_matches"] = r.get("matches", [])
         s["ali_validated"] = r.get("validated")
+        # PRIX AliExpress (cout d'achat dropshipper) recuperes via Lens.
+        s["ali_price_min"] = r.get("ali_price_min")
+        s["ali_price_avg"] = r.get("ali_price_avg")
+        s["ali_price_med"] = r.get("ali_price_med")
+        # MARGE dropship: prix de vente Etsy / prix d'achat AliExpress. Un ratio eleve
+        # (Etsy >> AliExpress) = preuve forte de dropshipping. On compare au prix MEDIAN
+        # AliExpress (robuste au bruit, le min seul peut etre une carte accessoire a $2).
+        etsy_price = s.get("price")
+        try: etsy_price = float(etsy_price) if etsy_price else None
+        except Exception: etsy_price = None
+        aref = s.get("ali_price_med") or s.get("ali_price_avg")
+        if etsy_price and aref and aref > 0:
+            s["ali_margin_ratio"] = round(etsy_price / aref, 1)
+        else:
+            s["ali_margin_ratio"] = None
+        # CONSENSUS PRECISION: une boutique est "dropship confirme" quand DEUX signaux
+        # independants concordent: (1) Lens trouve les produits sur AliExpress, ET (2) l'IA
+        # juge les produits industriels-revendables (ai_dropship). Score combine 0..1 =
+        # part des produits trouves (plafonnee) ponderee par la proba IA. Reduit fortement
+        # les faux positifs (produit visuellement proche mais en fait artisanal unique).
+        # SCORE DROPSHIP 0..100, calcule sur TOUS les produits testes (test_all=True).
+        # Trois composantes ponderees:
+        #   couverture (60%) = part des produits trouves identiques sur AliExpress (Lens)
+        #   IA dropship (25%) = proba produits industriels-revendables (ai_dropship)
+        #   marge (15%)       = prix Etsy / prix AliExpress, sature a 5x (=1.0)
+        cov = float(r.get("coverage") or 0.0)           # 0..1 (n_trouves / n_testes)
+        s["ali_coverage"] = round(cov, 2)
+        ad = s.get("ai_dropship")
+        ai_part = ad if ad is not None else 0.5         # neutre si IA absente
+        mr = s.get("ali_margin_ratio")
+        margin_norm = min(1.0, (mr - 1.0) / 4.0) if (mr and mr > 1.0) else 0.0  # 1x->0, 5x->1
+        score01 = 0.60 * cov + 0.25 * ai_part + 0.15 * margin_norm
+        s["dropship_score"] = round(score01, 2)
+        s["dropship_score100"] = round(100 * score01)
+        margin_boost = bool(mr is not None and mr >= 3.0)
+        if s.get("ali_validated") is None:
+            s["dropship_confirmed"] = None
+        elif s.get("ali_validated"):
+            s["dropship_confirmed"] = (ad is None) or (ad >= 0.4) or margin_boost
+        else:
+            s["dropship_confirmed"] = False
     return api
