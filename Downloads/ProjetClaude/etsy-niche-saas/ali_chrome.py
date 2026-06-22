@@ -1,22 +1,27 @@
-"""Lance TON Chrome reel en mode debug (--remote-debugging-port) sur ton profil habituel,
-pour que la detection dropship s'y connecte via CDP (ALI_CDP_URL). Ta session Google reste
-connectee et DBSC reste valide (meme machine) => Google Lens repond sans captcha ni mur login.
+"""Lance un Chrome reel en mode debug (--remote-debugging-port) sur un profil DEDIE, pour que
+la detection dropship s'y connecte via CDP (ALI_CDP_URL). Tu te connectes a Google UNE FOIS
+dans cette fenetre (vrai Chrome GUI => login non bloque), DBSC reste valide (meme machine),
+et Google Lens repond sans captcha. Le profil est reutilise aux runs suivants.
+
+Pourquoi un profil dedie et pas ton profil habituel:
+ - Chrome 136+ REFUSE --remote-debugging-port sur le profil par defaut (anti-vol de cookies).
+ - Un profil dedie contourne ce blocage; il suffit de s'y connecter a Google la 1re fois.
 
 Usage:
-    python ali_chrome.py            # lance Chrome debug + affiche la commande a exporter
+    python ali_chrome.py            # lance Chrome debug (profil dedie) + attend le port
     python ali_chrome.py --check    # verifie juste si le port debug repond
 
-Ensuite, dans le terminal qui lance la detection:
-    set ALI_CDP_URL=http://localhost:9222    (cmd)
-    $env:ALI_CDP_URL="http://localhost:9222" (PowerShell)
+Ensuite, terminal detection (PowerShell):
+    $env:ALI_CDP_URL="http://localhost:9222"
     python test_dropship_live.py
-
-IMPORTANT: ferme d'abord toutes tes fenetres Chrome (Chrome est mono-instance: sans fermeture,
-le flag debug est ignore). Ce script tente de fermer Chrome proprement si besoin.
 """
 import os, sys, time, json, subprocess, urllib.request, glob
 
 PORT = int(os.environ.get("ALI_CDP_PORT", "9222"))
+# profil DEDIE (sous cache/, gitignore). 1er run: login Google manuel. Ensuite reutilise.
+PROFILE = os.environ.get(
+    "ALI_CDP_PROFILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "chrome_debug"))
 
 def _chrome_exe():
     cands = [
@@ -30,22 +35,33 @@ def _chrome_exe():
     hits = glob.glob(os.path.expandvars(r"%ProgramFiles%\Google\Chrome*\Application\chrome.exe"))
     return hits[0] if hits else None
 
-def _user_data_dir():
-    # profil Chrome par defaut (ta session Google connectee y vit)
-    return os.path.expandvars(r"%LocalAppData%\Google\Chrome\User Data")
-
 def _debug_ok():
     try:
         with urllib.request.urlopen(f"http://localhost:{PORT}/json/version", timeout=3) as r:
-            d = json.loads(r.read())
-            return d.get("Browser", "chrome")
+            return json.loads(r.read()).get("Browser", "chrome")
     except Exception:
         return None
 
+def _kill_stray_debug():
+    """Tue UNIQUEMENT les chrome.exe lances sur NOTRE profil dedie (pas ton Chrome perso)."""
+    try:
+        import getpass  # noqa
+        out = subprocess.run(
+            ["wmic", "process", "where", "name='chrome.exe'", "get", "ProcessId,CommandLine"],
+            capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return
+    for line in out.splitlines():
+        if "chrome_debug" in line or PROFILE in line:
+            tok = line.split()
+            pid = tok[-1] if tok and tok[-1].isdigit() else None
+            if pid:
+                try: subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=10)
+                except Exception: pass
+
 def main():
     if "--check" in sys.argv:
-        b = _debug_ok()
-        print(f"debug port {PORT}:", b or "INJOIGNABLE")
+        print(f"debug port {PORT}:", _debug_ok() or "INJOIGNABLE")
         return
     if _debug_ok():
         print(f"Chrome debug deja actif sur :{PORT}. Rien a faire.")
@@ -55,26 +71,33 @@ def main():
     if not exe:
         print("chrome.exe introuvable. Installe Chrome ou ajuste _chrome_exe().")
         return
-    udd = _user_data_dir()
+    os.makedirs(PROFILE, exist_ok=True)
+    first = not os.path.exists(os.path.join(PROFILE, "Default"))
+    _kill_stray_debug()
     print(f"Chrome : {exe}")
-    print(f"Profil : {udd}")
-    print("\n>>> FERME toutes tes fenetres Chrome maintenant (sinon le flag debug est ignore).")
-    input(">>> Quand Chrome est ferme, appuie sur ENTREE... ")
-    # relance ton Chrome avec le port debug sur ton vrai profil
-    args = [exe, f"--remote-debugging-port={PORT}", f'--user-data-dir={udd}',
-            "--restore-last-session", "--no-first-run"]
+    print(f"Profil dedie : {PROFILE}")
+    # PAS besoin de fermer ton Chrome perso: profil dedie + port = instance separee.
+    args = [exe, f"--remote-debugging-port={PORT}", f"--user-data-dir={PROFILE}",
+            "--no-first-run", "--no-default-browser-check", "--new-window",
+            "https://lens.google.com/"]
     subprocess.Popen(args, close_fds=True)
-    # attend que le port reponde
-    for _ in range(20):
+    for _ in range(25):
         time.sleep(0.7)
         b = _debug_ok()
         if b:
             print(f"\nOK Chrome debug actif: {b} sur :{PORT}")
-            print("Verifie dans Chrome que tu es bien connecte a Google + lens.google.com sans captcha.")
-            print(f'\nDans ton terminal detection:\n  $env:ALI_CDP_URL="http://localhost:{PORT}"')
+            if first:
+                print("\n>>> 1er lancement: CONNECTE-TOI a Google dans cette fenetre Chrome.")
+                print(">>> Verifie que lens.google.com s'ouvre SANS captcha.")
+                print(">>> (login dans un vrai Chrome GUI => pas de blocage 'navigateur pas securise')")
+            else:
+                print("Profil deja connecte. Verifie lens.google.com sans captcha.")
+            print(f'\nDetection:\n  $env:ALI_CDP_URL="http://localhost:{PORT}"')
             print("  python test_dropship_live.py")
+            print("\nLAISSE cette fenetre Chrome OUVERTE pendant la detection.")
             return
-    print("Port debug ne repond pas. Chrome etait peut-etre deja ouvert sans le flag => referme tout et reessaie.")
+    print("Port debug ne repond toujours pas.")
+    print("=> un autre Chrome tourne peut-etre sur ce profil. Lance: python ali_chrome.py --check")
 
 if __name__ == "__main__":
     main()
