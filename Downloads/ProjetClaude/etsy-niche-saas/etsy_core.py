@@ -1799,14 +1799,16 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # mais on NE FILTRE PLUS dur (ali_gate=False): on montre TOUTES les boutiques similaires et
     # on trie les dropship-confirmees en tete. Sinon sur une niche artisanale (ex: ustensiles
     # bois) le gate dur renvoyait 0 boutique. L'utilisateur voit tout + le statut dropship.
-    # VITESSE: on NE valide PAS chaque candidat par image/Lens (1 Chrome => minutes + fragile).
-    # Le label dropship vient de l'IA (ai_dropship, instantane). La validation image precise
-    # reste dispo dans le flux principal (case AliExpress) ou par boutique a la demande.
+    # PERTINENCE: on GARDE le filtre match IA (les boutiques doivent vraiment vendre le meme
+    # type de produit, pas juste avoir 1 listing tangent) => sinon des boutiques sans rapport
+    # (t-shirts, campervan...) passaient. Le 0-resultat precedent venait d'un CRASH de
+    # validation (corrige), pas de ce filtre.
+    # VITESSE: on NE valide PAS pendant la collecte (sinon on validerait ~20 candidats/mot-cle
+    # via 1 Chrome => >10 min). On collecte vite les candidats PERTINENTS, puis on valide
+    # SEULEMENT les boutiques finales montrees (cf validation ciblee plus bas).
     f["validate_ali"] = False
-    f["ali_gate"] = False                  # ne jamais filtrer ici: on montre toutes les similaires
-    f["use_ai"] = True                     # IA = niche + label dropship (ai_dropship)
-    f["clone_mode"] = True                 # similaires par niche: PAS de match strict au mot-cle
-                                           # (sinon l'IA jetait presque tous les candidats => 0)
+    f["ali_gate"] = False                  # montrer toutes les similaires, dropship en tete (pas de filtre dur)
+    f["use_ai"] = True                     # IA = niche + match pertinence + label dropship
     scrape_mode = (mode == "scrape")
     name = resolve_shop_name(shop_input)
     src = _scan_shop_scrape(name) if scrape_mode else lookup_shop(name)
@@ -1882,6 +1884,23 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
         ad = s.get("ai_dropship")
         return 2 if (ad is not None and ad >= 0.5) else 1
     merged.sort(key=lambda x: (-_drop_rank(x), -(x.get("ai_dropship") or 0), -x.get("rate", 0)))
+    # VALIDATION DROPSHIP CIBLEE: on valide par image/texte SEULEMENT les boutiques finales
+    # montrees (les + probables d'abord), pas tout l'echantillon => verif faite ET rapide.
+    # ali_gate reste False: on n'enleve personne, on ANNOTE (dropship_confirmed / score).
+    if f.get("validate_ali_final", True) and merged and not _stopped(stop):
+        # plafond pour borner le temps (1 Chrome): on valide au + les N premieres (les + probables
+        # dropship par l'IA); au-dela, label IA seul. Override via filtre 'ali_validate_max'.
+        cap = int(f.get("ali_validate_max", 8) or 8)
+        topn = merged[:min(max(target_count, 1), cap)]
+        try:
+            nprod = int(f.get("ali_products", 4) or 4)
+            minm = int(f.get("ali_min_match", 1) or 1)
+            validate_shops_ali(topn, nprod, minm, stop=stop)
+            ali_used = True
+        except Exception:
+            pass
+        # re-trie apres validation (dropship confirme remonte)
+        merged.sort(key=lambda x: (-_drop_rank(x), -(x.get("ai_dropship") or 0), -x.get("rate", 0)))
     res = {
         "source": {
             "id": src_id, "name": src.get("name"), "url": src.get("url"),
