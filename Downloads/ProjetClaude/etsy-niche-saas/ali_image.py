@@ -1059,15 +1059,17 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
         sem = asyncio.Semaphore(conc)
         async def _one(prod):
             async with sem:
-                pg = await ctx.new_page()
+                pg = None
                 try:
+                    pg = await ctx.new_page()
                     await _inject_cookies_once(pg)
                     return prod, await _check_lens(pg, prod)
                 except Exception:
                     return prod, (False, "erreur", {})
                 finally:
-                    try: await pg.close()
-                    except Exception: pass
+                    if pg is not None:
+                        try: await pg.close()
+                        except Exception: pass
         try:
             out = await asyncio.gather(*[_one(p) for p in prods])
         finally:
@@ -1091,14 +1093,16 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
         sem = asyncio.Semaphore(conc)
         async def _one(prod):
             async with sem:
-                pg = await ctx.new_page()
+                pg = None
                 try:
+                    pg = await ctx.new_page()   # peut echouer si le Chrome lache la connexion
                     return prod, await _check_lens(pg, prod)
                 except Exception:
                     return prod, (False, "erreur", {})
                 finally:
-                    try: await pg.close()
-                    except Exception: pass
+                    if pg is not None:
+                        try: await pg.close()
+                        except Exception: pass
         try:
             out = await asyncio.gather(*[_one(p) for p in prods])
         finally:

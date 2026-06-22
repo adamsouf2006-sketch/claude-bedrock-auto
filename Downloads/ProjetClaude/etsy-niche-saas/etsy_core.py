@@ -549,7 +549,11 @@ def ai_enrich_shops(shops, f):
     # hors-sujet quand un mot-cle est tape). Si l'IA a majoritairement echoue (peu de
     # verdicts), on reste tolerant pour ne pas tout supprimer a tort.
     coverage = len(verdict) / max(len(shops), 1)
-    strict = bool(query) and coverage >= 0.5
+    # CLONE FINDER: on cherche des boutiques SIMILAIRES (meme type de produits), pas un match
+    # strict au mot-cle. Le gate strict (match==true exige) jetait presque tous les candidats
+    # => 0 resultat. En mode clone on garde le label/niche IA mais on NE jette PAS sur le match.
+    clone_mode = bool(f.get("clone_mode"))
+    strict = bool(query) and coverage >= 0.5 and not clone_mode
     kept = []
     # 1er passage: applique verdict + collecte les libelles libres par cle de regroupement
     canon_labels = {}                      # canon -> Counter(libelles bruts)
@@ -564,7 +568,7 @@ def ai_enrich_shops(shops, f):
             kept.append(s); continue
         if not v.get("accept", True):
             continue                            # IA rejette: hors cible
-        if query and v.get("match") is not True:
+        if query and v.get("match") is not True and not clone_mode:
             continue                            # match doit etre EXPLICITEMENT true (strict)
         raw = (str(v.get("niche") or "")).strip() or "Divers"
         key = niche_canon(raw) or raw.lower()
@@ -1795,9 +1799,14 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # mais on NE FILTRE PLUS dur (ali_gate=False): on montre TOUTES les boutiques similaires et
     # on trie les dropship-confirmees en tete. Sinon sur une niche artisanale (ex: ustensiles
     # bois) le gate dur renvoyait 0 boutique. L'utilisateur voit tout + le statut dropship.
-    f["validate_ali"] = True
-    f["ali_gate"] = False                  # annoter, pas filtrer (recall preserve)
-    f["use_ai"] = True                     # jugement IA dropship (consensus avec Lens)
+    # VITESSE: on NE valide PAS chaque candidat par image/Lens (1 Chrome => minutes + fragile).
+    # Le label dropship vient de l'IA (ai_dropship, instantane). La validation image precise
+    # reste dispo dans le flux principal (case AliExpress) ou par boutique a la demande.
+    f["validate_ali"] = False
+    f["ali_gate"] = False                  # ne jamais filtrer ici: on montre toutes les similaires
+    f["use_ai"] = True                     # IA = niche + label dropship (ai_dropship)
+    f["clone_mode"] = True                 # similaires par niche: PAS de match strict au mot-cle
+                                           # (sinon l'IA jetait presque tous les candidats => 0)
     scrape_mode = (mode == "scrape")
     name = resolve_shop_name(shop_input)
     src = _scan_shop_scrape(name) if scrape_mode else lookup_shop(name)
@@ -1867,8 +1876,12 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # vraies cibles dropship en haut, sans perdre les autres similaires.
     def _drop_rank(s):
         dc = s.get("dropship_confirmed")
-        return 2 if dc is True else (0 if dc is False else 1)
-    merged.sort(key=lambda x: (-_drop_rank(x), -x.get("rate", 0)))
+        if dc is True:  return 2
+        if dc is False: return 0
+        # pas de validation image: on classe par le jugement IA dropship (ai_dropship).
+        ad = s.get("ai_dropship")
+        return 2 if (ad is not None and ad >= 0.5) else 1
+    merged.sort(key=lambda x: (-_drop_rank(x), -(x.get("ai_dropship") or 0), -x.get("rate", 0)))
     res = {
         "source": {
             "id": src_id, "name": src.get("name"), "url": src.get("url"),
