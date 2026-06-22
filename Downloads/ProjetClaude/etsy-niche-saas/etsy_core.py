@@ -2047,6 +2047,10 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # PREUVE FORTE: matches confirmes sur la page produit AliExpress (vraie og:image ~=
         # photo Etsy, pas le crop Lens). Signal le + fiable de "meme produit a la source".
         s["ali_page_confirmed"] = sum(1 for m in r.get("matches", []) if m.get("page_confirmed"))
+        # SIGNAL TEXTE (dropshippers a photos custom, ex Kitchenova): produits generiques
+        # trouves sur AliExpress par TEXTE quand l'image ne matche pas. Combine avec l'IA.
+        s["ali_text_hits"] = r.get("text_hits", 0)
+        s["ali_text_coverage"] = r.get("text_coverage", 0.0)
         # FORCE DES MATCHES (point 4): chaque produit trouve est grade exact/strong/weak avec
         # des points (70/40/15). On compte chaque categorie + le score MOYEN par produit trouve.
         # Verdict simple par boutique sur la moyenne: >=70 dropship probable, 40-70 douteux,
@@ -2115,10 +2119,20 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # SCORE: si l'IA est absente on n'injecte PLUS un ai_part=0.5 fictif (biais qui
         # gonflait le score meme sans preuve IA). On renormalise les poids sur les 2
         # signaux restants: coverage -> 0.80 (0.60/0.75) et marge -> 0.20 (0.15/0.75).
+        # SIGNAL TEXTE (dropshippers a photos custom, ex Kitchenova): le produit generique
+        # existe sur AliExpress (trouve en TEXTE) meme si l'image ne matche pas. On ne le compte
+        # QUE si l'IA juge le produit industriel-revendable (ad >= 0.5) => l'IA est le garde-fou
+        # qui evite de flagger un artisan dont le produit a un nom generique.
+        tcov = float(s.get("ali_text_coverage") or 0.0)
+        text_consensus = bool(tcov >= 0.5 and ad is not None and ad >= 0.5)
+        s["dropship_suspect"] = text_consensus     # photo custom: texte + IA concordent
+        text_sig = tcov if (ad is not None and ad >= 0.5) else 0.0
         if ad is None:
             score01 = (0.60 / 0.75) * cov + (0.15 / 0.75) * margin_norm
         else:
-            score01 = 0.60 * cov + 0.25 * ad + 0.15 * margin_norm
+            score01 = 0.55 * cov + 0.20 * ad + 0.10 * margin_norm + 0.15 * text_sig
+        if text_consensus and cov < 0.01:
+            score01 = max(score01, 0.55)            # dropship "photo custom" confirme texte+IA
         s["dropship_score"] = round(score01, 2)
         s["dropship_score100"] = round(100 * score01)
         # VERDICT CONSENSUS: un seul signal (Lens) ne suffit pas a confirmer du dropship.
@@ -2138,5 +2152,6 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
             else:
                 s["dropship_confirmed"] = (ad >= 0.4) or margin_boost or page_boost
         else:
-            s["dropship_confirmed"] = False
+            # pas valide par IMAGE: confirme quand meme si consensus TEXTE + IA (photo custom).
+            s["dropship_confirmed"] = True if text_consensus else False
     return api

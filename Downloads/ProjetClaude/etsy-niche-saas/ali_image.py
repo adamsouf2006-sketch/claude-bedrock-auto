@@ -166,6 +166,17 @@ async def _inject_cookies_once(page):
 # remonte surtout des agregateurs (imall.com) avec des produits DIFFERENTS => faux positifs,
 # 0 gain reel sur AliExpress + cout temps. Override ALI_YANDEX=1 pour le reactiver.
 YANDEX_FALLBACK = _os.environ.get("ALI_YANDEX", "0") not in ("0", "false", "no")
+# SIGNAL TEXTE (recall dropshippers a photos custom): si l'image ne matche rien, on cherche le
+# produit par TEXTE sur AliExpress. Signal ANNEXE (pas un hit confirme) combine avec l'IA cote
+# etsy_core. Active par defaut. ALI_TEXT=0 pour couper. TEXT_SIM_MIN = seuil de similarite titre
+# Etsy vs resultat AliExpress pour considerer le produit "trouve en texte".
+TEXT_FALLBACK = _os.environ.get("ALI_TEXT", "1") not in ("0", "false", "no")
+try: TEXT_SIM_MIN = float(_os.environ.get("ALI_TEXT_SIM", "0.34"))
+except Exception: TEXT_SIM_MIN = 0.34
+# Nb mini de resultats AliExpress (requete specifique) pour considerer le produit "existe"
+# (signal cross-langue, cf _text_signal). Un produit generique de masse en remonte beaucoup.
+try: TEXT_MIN_RESULTS = int(_os.environ.get("ALI_TEXT_MIN_RESULTS", "6"))
+except Exception: TEXT_MIN_RESULTS = 6
 # FALLBACK natif AliExpress (upload image par drag-drop simule). Active par defaut: uploade
 # l'image directement dans le moteur image AliExpress => vrais produits + prix exacts.
 # Override ALI_NATIVE=0. Captcha Datadome gere (pas de penalite boutique).
@@ -817,7 +828,45 @@ async def _check_lens(pg, prod):
                     return (True, "yandex", d)
     if captcha:                         # aucun hit ET captcha => via=captcha (=> retry proxy rotate)
         return (False, "captcha", {"n": 0})
+    # 3) SIGNAL TEXTE (recall dropshippers a photos custom, type Kitchenova): l'image n'a rien
+    # donne (le vendeur a re-photographie le produit) MAIS le produit GENERIQUE peut exister sur
+    # AliExpress. On cherche par TEXTE et on mesure la similarite de titre. Ce n'est PAS un hit
+    # image confirme (hit=False) => ca ne valide PAS seul la boutique; c'est un signal ANNEXE
+    # remonte dans detail, que etsy_core combine avec le jugement IA (l'IA tranche artisan vs
+    # industriel => evite les faux positifs ou un artisan fait un produit au nom generique).
+    if TEXT_FALLBACK:
+        tdet = await _text_signal(pg, title)
+        if tdet:
+            return (False, "text", tdet)
     return (False, "image", {"n": 0})
+
+async def _text_signal(pg, title):
+    """Cherche le produit par TEXTE sur AliExpress. Retourne un detail {text_match, text_sim,
+    n, ali_price?} si AliExpress remonte des resultats au titre proche, sinon {}.
+    text_match=True => le produit (generique) existe sur AliExpress (signal dropship ANNEXE)."""
+    q = _kw(title, 6)
+    if not q:
+        return {}
+    try:
+        titles = await _ali_text_search(pg, q)
+    except Exception:
+        return {}
+    if not titles:
+        return {}
+    # CROSS-LANGUE: AliExpress renvoie des titres traduits (francais) alors que le titre Etsy
+    # est anglais => la similarite de titre est ~0 et ne marche pas. Le vrai signal = AliExpress
+    # remonte BEAUCOUP de resultats pour la requete SPECIFIQUE (mots-cles produit). Un produit
+    # generique de masse => 6+ resultats; un objet artisanal unique => peu/pas. On garde aussi
+    # la similarite titre quand elle marche (meme langue). L'IA (cote etsy_core) tranche ensuite
+    # artisan vs industriel => le bruit "AliExpress renvoie toujours qqch" est filtre par l'IA.
+    best = max((_sim(title, t) for t in titles), default=0.0)
+    prices = sorted(p for p in (_parse_price(t) for t in titles) if p is not None)
+    text_match = (len(titles) >= TEXT_MIN_RESULTS) or (best >= TEXT_SIM_MIN)
+    det = {"text_match": bool(text_match), "text_sim": round(best, 2),
+           "n": len(titles), "strength": "text", "points": 0}
+    if prices:
+        det["ali_price"] = round(prices[len(prices)//2], 2)
+    return det
 
 async def _verified(img, results):
     """Confronte les vignettes resultats a l'image Etsy `img` par hash perceptuel.
@@ -1084,6 +1133,7 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
     else:                                   # patchright ET cdp ont besoin du contexte playwright
         async with async_playwright() as p:
             outcome = await _drive(p)
+    res["text_hits"] = 0
     for prod in products:
         hit, via, detail = outcome[id(prod)]
         res["checked"] += 1
@@ -1091,6 +1141,11 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
         if hit:
             res["hits"] += 1
             res["matches"].append({"title": prod.get("title","")[:60], "via": via, **detail})
+        elif via == "text" and detail.get("text_match"):
+            # signal ANNEXE: produit generique trouve en texte sur AliExpress (photo custom =>
+            # image rate). Compte separement; etsy_core le combine avec l'IA.
+            res["text_hits"] += 1
+            res["matches"].append({"title": prod.get("title","")[:60], "via": "text", **detail})
     if res.get("blocked"):
         res["validated"] = None   # inconnu (AliExpress a bloque)
     else:
@@ -1107,6 +1162,10 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
     # seulement si test_all (sinon on s'arrete tot => denominateur partiel). 0..1.
     tested = res["checked"] or 0
     res["coverage"] = round(res["hits"] / tested, 3) if tested else 0.0
+    # COUVERTURE TEXTE: part des produits trouves GENERIQUEMENT sur AliExpress par texte
+    # (signal dropship "photo custom"). Combine avec l'IA cote etsy_core (l'IA tranche
+    # artisan/industriel => evite de flagger un artisan au nom de produit generique).
+    res["text_coverage"] = round(res["text_hits"] / tested, 3) if tested else 0.0
     return res
 
 def validate_shop(products, min_match=3, hash_thresh=12, sim_thresh=0.30, headless=None, test_all=False):
