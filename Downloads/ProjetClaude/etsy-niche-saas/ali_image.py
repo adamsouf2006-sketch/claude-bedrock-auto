@@ -921,7 +921,14 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
     # MOTEUR: scrapling (camoufox furtif, MEME anti-bot que scraper.py) par defaut s'il est
     # installe => bien plus resistant aux captchas Lens que patchright chromium. Override
     # ALI_ENGINE=patchright pour forcer l'ancien moteur.
-    engine = _os3.environ.get("ALI_ENGINE", "scrapling" if SCRAPLING_OK else "patchright").lower()
+    # MOTEUR CDP: si ALI_CDP_URL est defini (ton vrai Chrome lance en mode debug via
+    # ali_chrome.py), on s'y CONNECTE => session Google deja connectee (DBSC valide car MEME
+    # appareil) => Lens repond sans captcha ni mur login. Prioritaire s'il est configure.
+    cdp_url = _os3.environ.get("ALI_CDP_URL", "").strip()
+    engine = _os3.environ.get("ALI_ENGINE", "cdp" if cdp_url else
+                              ("scrapling" if SCRAPLING_OK else "patchright")).lower()
+    if engine == "cdp" and not cdp_url:
+        cdp_url = "http://localhost:9222"
     if engine == "scrapling" and not SCRAPLING_OK:
         engine = "patchright"
 
@@ -1004,8 +1011,39 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
             except Exception: pass
         return {id(prod): r for prod, r in out}
 
+    # --- moteur CDP: connexion a TON Chrome reel (lance par ali_chrome.py avec
+    # --remote-debugging-port). On REUTILISE son contexte (deja connecte a Google) =>
+    # DBSC valide (meme machine) => Lens repond. On NE ferme PAS le navigateur (c'est le
+    # tien): on ouvre/ferme seulement des onglets. ---
+    async def _round_cdp(p, prods):
+        try:
+            br = await p.chromium.connect_over_cdp(cdp_url, timeout=15000)
+        except Exception as ex:
+            # Chrome debug injoignable => on signale clairement (pas un captcha boutique)
+            res["error"] = f"CDP injoignable ({cdp_url}): lance d'abord ali_chrome.py"
+            return {id(pr): (False, "erreur", {}) for pr in prods}
+        # contexte existant (ta session connectee); fallback: en creer un
+        ctx = br.contexts[0] if br.contexts else await br.new_context()
+        sem = asyncio.Semaphore(conc)
+        async def _one(prod):
+            async with sem:
+                pg = await ctx.new_page()
+                try:
+                    return prod, await _check_lens(pg, prod)
+                except Exception:
+                    return prod, (False, "erreur", {})
+                finally:
+                    try: await pg.close()
+                    except Exception: pass
+        try:
+            out = await asyncio.gather(*[_one(p) for p in prods])
+        finally:
+            try: await br.close()          # detache la connexion CDP, ne tue PAS ton Chrome
+            except Exception: pass
+        return {id(prod): r for prod, r in out}
+
     async def _drive(p):
-        """Boucle de rounds anti-captcha commune aux 2 moteurs. p = playwright ctx (patchright)
+        """Boucle de rounds anti-captcha commune aux moteurs. p = playwright ctx (patchright/cdp)
         ou None (scrapling). Remplit `outcome` et flag res['blocked'] si captcha persistant."""
         outcome = {}
         todo = list(products)
@@ -1013,6 +1051,8 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
         for rnd in range(max_rounds):
             if engine == "scrapling":
                 res_round = await _round_scrapling(proxy_raw, todo)
+            elif engine == "cdp":
+                res_round = await _round_cdp(p, todo)
             else:
                 res_round = await _round_patchright(p, proxy_raw, todo)
             outcome.update(res_round)
@@ -1026,7 +1066,7 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
 
     if engine == "scrapling":
         outcome = await _drive(None)
-    else:
+    else:                                   # patchright ET cdp ont besoin du contexte playwright
         async with async_playwright() as p:
             outcome = await _drive(p)
     for prod in products:
