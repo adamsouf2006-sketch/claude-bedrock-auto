@@ -107,6 +107,7 @@ class H(BaseHTTPRequestHandler):
                     sse2({"type": "error", "error": str(e)})
                 finally:
                     if sid: core.clear_cancel(sid)
+                    core.close_browsers()      # ferme onglets/pages: recherche finie
                 return
             try:
                 res = core.find_similar_shops(shop_input=shop, target_count=min(target, 300),
@@ -114,6 +115,8 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(res, ensure_ascii=False))
             except Exception as e:
                 return self._send(500, json.dumps({"error": str(e)}))
+            finally:
+                core.close_browsers()          # ferme onglets/pages: recherche finie
         if u.path in ("/api/discover", "/api/export", "/api/discover_stream"):
             q = parse_qs(u.query)
             def gi(k, d):  # get int
@@ -191,6 +194,7 @@ class H(BaseHTTPRequestHandler):
                     sse({"type": "error", "error": str(e)})
                 finally:
                     if sid: core.clear_cancel(sid)
+                    core.close_browsers()      # ferme onglets/pages: recherche finie
                 return
 
             if u.path == "/api/export":
@@ -215,6 +219,9 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(res, ensure_ascii=False))
             except Exception as e:
                 return self._send(500, json.dumps({"error": str(e)}))
+            finally:
+                if source in ("scrape", "live"):
+                    core.close_browsers()      # ferme onglets/pages: recherche finie
         return self._send(404, json.dumps({"error": "not found"}))
 
 

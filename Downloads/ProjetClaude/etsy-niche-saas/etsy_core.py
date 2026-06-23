@@ -31,6 +31,16 @@ def clear_cancel(token):
 def _stopped(stop):
     return bool(stop is not None and stop.is_set())
 
+def close_browsers():
+    """Ferme le navigateur de scraping (onglets/pages) a la FIN d'une recherche. Le serveur
+    l'appelle quand la recherche est terminee => les fenetres/onglets se ferment au lieu de
+    rester ouverts en arriere-plan. Sans danger si aucun navigateur n'est ouvert."""
+    try:
+        import scraper
+        scraper.close_session()
+    except Exception:
+        pass
+
 ENRICH_WORKERS = 4      # appels API Etsy en parallele (+ retry 429 dans _get)
 AI_WORKERS = 8          # lots IA en parallele (failover gere par cle) — + de debit
 DAY_LIMIT_DEFAULT = 5000  # quota Etsy/jour par defaut (reset 00:00 UTC)
@@ -2713,6 +2723,9 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # positif => on bride. Cas ImperfectBySian (55 mois, 40% Lens) qui sortait a 80/100.
         try: _age = float(s.get("months")) if s.get("months") is not None else None
         except Exception: _age = None
+        # La confirmation page produit (vraie image source AliExpress = photo Etsy) est une PREUVE
+        # IMAGE FORTE. Definie AVANT strong_proof qui s'en sert (sinon UnboundLocalError).
+        page_boost = bool(s.get("ali_page_confirmed", 0) >= 1)
         strong_proof = (cov >= 0.70) or page_boost or bool(mr is not None and mr >= 5.0)
         age_gate = False
         if _age is not None and _age > 24 and not strong_proof:
@@ -2727,9 +2740,7 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # (le gate de filtrage etsy_core.py:1651 retombe sur ali_validated quand
         # dropship_confirmed est None => le recall est preserve, seul le label change).
         margin_boost = bool(mr is not None and mr >= 3.0)
-        # La confirmation page produit est un 2e signal independant fort (vraie image source
-        # AliExpress identique a la photo Etsy) => suffit a confirmer comme la marge.
-        page_boost = bool(s.get("ali_page_confirmed", 0) >= 1)
+        # page_boost (confirmation page produit AliExpress) deja calcule plus haut.
         # PROFIL fortement dropship (jeune + catalogue incoherent + IA titres haute) = 2e signal
         # INDEPENDANT de Lens. Confirme quand Lens est aveugle (cas MoroaHouse: produits chinois
         # non indexes). Seuil HAUT (0.8) pour ne pas confirmer un artisan sur du bruit.
