@@ -2219,6 +2219,12 @@ def _smart_sample_idx(pool, k, seed=0):
     sel += rest[:max(0, k - len(sel))]
     return sorted(set(sel))[:k]
 
+# Plafond d'echantillon image par boutique. On veut >=50% du catalogue (legitimite), mais Lens
+# est lent (1 Chrome, ~qq s/produit) => on borne pour ne pas exploser le temps sur les gros
+# catalogues. Reglable via env ALI_SAMPLE_CAP. 20 = compromis (50% jusqu'a ~40 produits couvert).
+try: _SAMPLE_CAP = int(os.environ.get("ALI_SAMPLE_CAP", "20"))
+except Exception: _SAMPLE_CAP = 20
+
 def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=True, stop=None,
                        use_vision=False):
     """Verifie si les produits d'une boutique existent A L'IDENTIQUE sur AliExpress.
@@ -2254,8 +2260,20 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
             s.setdefault("ali_blocked", False); s.setdefault("ali_matches", [])
             continue
         raw_titles = s.get("titles") or [s.get("sample", "")]
+        # ECHANTILLON LEGITIME (regle utilisateur): pour juger du dropship il faut analyser AU
+        # MOINS 50% du catalogue, pas 4 produits sur 90. On teste donc max(nprod, 50% du
+        # catalogue), plafonne a SAMPLE_CAP (temps: 1 Chrome Lens, ~qq s/produit). Un verdict
+        # sur <50% du catalogue est marque non-legitime (ali_partial) et n'autorise PAS un
+        # "dropship_confirmed" positif a lui seul.
+        catalog_n = len([t for t in raw_titles if t])
+        half = -(-catalog_n // 2)                      # ceil(50%)
+        eff_nprod = min(max(int(nprod), half), _SAMPLE_CAP)
+        s["catalog_n"] = catalog_n
+        s["sample_n"] = min(eff_nprod, catalog_n)
+        s["sample_pct"] = round(s["sample_n"] / catalog_n, 2) if catalog_n else 0.0
+        s["ali_partial"] = bool(catalog_n and s["sample_pct"] < 0.5)   # <50% = verdict non-legitime
         raw_imgs = s.get("images") or []
-        titles = raw_titles[:nprod]
+        titles = raw_titles[:eff_nprod]
         # Source des images produit:
         # - MODE SCRAPE: le scraper a deja recupere les images de la page boutique
         #   (s["images"], alignees sur s["titles"]) => 0 appel API Etsy.
@@ -2271,11 +2289,11 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
             # (top page + milieu + aleatoire) au lieu de prendre betement les premiers, et on
             # applique les MEMES indices aux titres ET aux images (alignement strict).
             pool = min(len(raw_titles), len(raw_imgs))
-            idx = _smart_sample_idx(pool, nprod, seed=hash(str(s.get("id") or s.get("name") or "")) & 0xffffffff)
+            idx = _smart_sample_idx(pool, eff_nprod, seed=hash(str(s.get("id") or s.get("name") or "")) & 0xffffffff)
             titles = [raw_titles[i] for i in idx]
             prod_imgs = [([raw_imgs[i]] if raw_imgs[i] else []) for i in idx]
         elif str(s.get("id", "")).isdigit():
-            ids = fetch_shop_listing_ids(s["id"], n=nprod)
+            ids = fetch_shop_listing_ids(s["id"], n=eff_nprod)
             if ids: api += 1
             # per=3 => 3 photos/produit (memes tri score => ordre aligne aux titres). Plus
             # d'images = plus de chances que Lens relie une des vues a une URL AliExpress.
