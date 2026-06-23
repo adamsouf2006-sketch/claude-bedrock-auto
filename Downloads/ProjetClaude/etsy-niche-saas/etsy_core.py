@@ -994,30 +994,34 @@ def _cursor_set(key, val):
     except Exception: pass
 
 # ---------------- api ----------------
-def _get(path, _tries=4):
+def _get(path, _tries=3):
     """Appel API Etsy avec RETRY sur 429 (rate-limit) et 5xx. Indispensable car on
     enrichit en parallele (rafales) => Etsy renvoie ponctuellement 429. Backoff
-    exponentiel (respecte Retry-After si fourni). Quota maj en temps reel."""
+    exponentiel (respecte Retry-After si fourni). Quota maj en temps reel.
+    FAIL-FAST: timeout court (12s) + peu d'essais => sous throttle/blocage IP (403 ou reseau
+    blackhole) on ECHOUE VITE avec un message clair au lieu de HANG l'UI ~2min."""
     req = urllib.request.Request(BASE + path, headers={"x-api-key": API_KEY})
     for attempt in range(_tries):
         try:
-            r = urllib.request.urlopen(req, timeout=25)
+            r = urllib.request.urlopen(req, timeout=12)
             raw = r.read(); headers = r.headers
             break
         except urllib.error.HTTPError as e:       # 401/429/5xx => corps souvent non-JSON
             _update_quota(e.headers.get("x-remaining-today"), e.headers.get("x-limit-per-day"))
-            # 403 = throttle edge/Datadome TRANSITOIRE sur rafales paralleles (cle valide). Avant
-            # il n'etait PAS retente => un seul 403 burst tuait tout le run ("Erreur: http 403").
-            # On le retente avec backoff (un peu plus long): la cle marche, c'est juste une rafale.
+            # 403 = throttle edge/Datadome (rafales OU IP temporairement blacklistee). On retente
+            # 1-2 fois avec un court backoff; si ca persiste => message EXPLICITE (IP throttlee,
+            # laisser reposer / activer proxies) au lieu d'un "http 403" opaque.
             if e.code in (403, 429, 500, 502, 503, 504) and attempt < _tries - 1:
                 try: wait = float(e.headers.get("Retry-After") or 0)
                 except Exception: wait = 0
-                base = 1.2 if e.code == 403 else 0.6        # 403 throttle: backoff + long
-                time.sleep(wait or (base * (2 ** attempt)))  # backoff exponentiel
+                time.sleep(wait or (0.8 * (2 ** attempt)))   # backoff court: 0.8,1.6s
                 continue
             raw = e.read()
             try: msg = json.loads(raw.decode("utf-8", "replace")).get("error", "")
             except Exception: msg = raw.decode("utf-8", "replace")[:200]
+            if e.code == 403:
+                raise RuntimeError("Etsy throttle ton IP (403): trop de requetes recentes. "
+                                   "Laisse reposer ~30-60min OU active des proxies. (" + path + ")")
             raise RuntimeError(f"Etsy API {e.code} {path}: {msg or e.reason}")
         except urllib.error.URLError as e:         # reseau/timeout => retry
             if attempt < _tries - 1:
