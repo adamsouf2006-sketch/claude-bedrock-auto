@@ -208,12 +208,21 @@ quota();
 setInterval(quota,15000);
 
 function tbl(shops){
-  const hasAli=shops.some(s=>s.ali_hits!=null);
+  const hasAli=shops.some(s=>s.ali_hits!=null||s.dropship_score100!=null);
   let h=`<table><thead><tr><th>Boutique</th><th>Pays</th><th>Ventes/mois</th><th>Total</th><th>Âge</th><th>Conf.</th>${hasAli?"<th>Dropship</th>":""}<th>Produit</th><th>AliExpress</th></tr></thead><tbody>`;
   for(const s of shops){
     const conf=s.niche_conf!=null?Math.round(s.niche_conf*100)+"%":"—";
     let aliCell="";
-    if(hasAli){
+    if(hasAli && s.ali_hits==null){
+      // mode photos IA (pas de Lens): moyenne photos + nb produits niche
+      const sc=s.dropship_score100;
+      const scTag=sc!=null?`<b style="color:${sc>=50?'#2e7d32':'#999'}">${sc}/100</b>`:"";
+      const pa=s.photo_drop_avg!=null?` · 📷 moy ${Math.round(s.photo_drop_avg*100)}% (${s.photo_n||0} photos)`:"";
+      const nc=s.niche_count!=null?` · 🍴 ${s.niche_count} produits niche`:"";
+      const cn=(s.country||"").toUpperCase();
+      const cnTag=["CN","HK","TW","MO"].includes(cn)?` · <b style="color:#c0392b">${cn} pays-drop</b>`:"";
+      aliCell=`<td>${scTag}<span class="mut">${pa}${nc}${cnTag}</span></td>`;
+    } else if(hasAli){
       const via=s.ali_via?Object.keys(s.ali_via).join("/"):"";
       const icon=s.ali_blocked?"❔":(s.ali_validated?"✅":"❌");
       let extra="";
@@ -339,11 +348,13 @@ function renderSimilar(r){
     document.getElementById("clusters").innerHTML="";return;}
   const s=r.source||{}, p=r.profile||{};
   document.getElementById("stat").innerHTML=`
-    <div><b>${r.matched}</b><span>similaires trouvées</span></div>
-    <div><b>${r.clusters.length}</b><span>niches</span></div>
+    <div><b style="color:${r.exhausted?'#e67e22':'var(--ok)'}">${r.matched}</b><span>boutiques DROP / ${r.requested??r.matched} voulues</span></div>
+    <div><b>${r.validated_n??"?"}</b><span>analysées (Lens ≥50% catalogue)</span></div>
     <div><b style="color:var(--ok)">${r.api_used}</b><span>crédits API</span></div>
     <div><b>${r.quota_remaining??"?"}</b><span>quota restant</span></div>`;
   const c=document.getElementById("clusters");
+  if(r.exhausted){document.getElementById("stat").insertAdjacentHTML("beforeend",
+    `<div style="width:100%;color:#e67e22">⚠ Seulement ${r.matched} vraie(s) boutique(s) drop trouvée(s) sur ${r.requested} demandées (${r.relevant_candidates??"?"} candidats pertinents analysés). Cette niche a peu de dropshippers — augmente le budget ou change de source.</div>`);}
   if(r.stopped){document.getElementById("stat").insertAdjacentHTML("beforeend",
     '<div style="width:100%;color:#c0392b">⏹ Recherche arrêtée — résultats partiels.</div>');}
   const kw=(r.keywords||[]).map(k=>`<span class="pill">${k}</span>`).join(" ");

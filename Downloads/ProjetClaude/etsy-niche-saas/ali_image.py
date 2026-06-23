@@ -9,7 +9,7 @@ de ses produits sont trouves.
 Sync API utilisable depuis etsy_core:
   validate_shop_images(image_urls, min_match=3, hash_thresh=12) -> dict
 """
-import asyncio, io, re, threading, urllib.parse, urllib.request
+import asyncio, io, re, threading, time, urllib.parse, urllib.request
 from PIL import Image
 
 # ---- similarite titre (fallback texte, fiable) -------------------------------
@@ -180,12 +180,35 @@ except Exception: TEXT_MIN_RESULTS = 6
 # FALLBACK natif AliExpress (upload image par drag-drop simule). Active par defaut: uploade
 # l'image directement dans le moteur image AliExpress => vrais produits + prix exacts.
 # Override ALI_NATIVE=0. Captcha Datadome gere (pas de penalite boutique).
-# DESACTIVE par defaut: diagnostic a montre que l'upload image native ne marche PAS (drag-drop
-# non pris) => AliExpress renvoie des produits TENDANCE sans rapport (gloss, trottinettes, coques)
-# quelle que soit la photo => BRUIT PUR + source des faux positifs (artisans flagges dropship).
-# Le vrai signal vient de Google Lens (matching visuel deep-feature). Reactiver: ALI_NATIVE=1.
-NATIVE_FALLBACK = _os.environ.get("ALI_NATIVE", "0") not in ("0", "false", "no")
+# ACTIVE par defaut: l'upload utilise maintenant le VRAI input[type=file] (set_input_files),
+# valide en prod (test_ali_upload.py) => AliExpress uploade vers son OSS et renvoie de VRAIS
+# produits visuellement matches (moteur Alibaba deep-feature) + prix exacts + product_id.
+# C'est la methode de thieve.co/shopbysnap. L'ancien drag-drop simule etait ignore (=> bruit).
+# Desactiver: ALI_NATIVE=0.
+NATIVE_FALLBACK = _os.environ.get("ALI_NATIVE", "1") not in ("0", "false", "no")
 _CONSENT_DONE = False   # consentement Google accepte une fois par process (cookie persiste)
+
+# ---- SECURITE COMPTE AliExpress (anti-flag/anti-captcha) ---------------------------------
+# La recherche image native tape AliExpress avec TA session connectee. Un rythme trop rapide
+# ou trop de recherches paralleles ressemble a un bot => risque captcha Datadome / flag compte.
+# GARDE-FOUS:
+#  - SERIALISATION: une seule recherche native a la fois (lock global), JAMAIS en parallele
+#    (3 uploads simultanes sur le meme compte = signal bot evident).
+#  - JITTER: delai aleatoire humain entre 2 recherches native.
+#  - CAP: nombre max de recherches native par process (au-dela, on s'arrete => pas de hit
+#    native mais aucun risque). Lens (par URL, pas de compte) reste dispo sans limite.
+_NATIVE_LOCK = None                      # asyncio.Lock cree paresseusement (bonne event loop)
+_native_count = 0                        # nb de recherches native lancees ce process
+_native_last = 0.0                       # timestamp de la derniere recherche native
+try: NATIVE_MAX = int(_os.environ.get("ALI_NATIVE_MAX", "40"))
+except Exception: NATIVE_MAX = 40        # cap recherches native / process
+try: NATIVE_MIN_GAP = float(_os.environ.get("ALI_NATIVE_GAP", "4.0"))
+except Exception: NATIVE_MIN_GAP = 4.0   # secondes mini entre 2 recherches native
+def _native_lock():
+    global _NATIVE_LOCK
+    if _NATIVE_LOCK is None:
+        _NATIVE_LOCK = asyncio.Lock()
+    return _NATIVE_LOCK
 
 # ---- perceptual hash (Pillow seul) -------------------------------------------
 # On combine DEUX hash: aHash (luminance moyenne) + dHash (gradient horizontal). dHash capte
@@ -519,47 +542,52 @@ async def _ali_native_search(pg, image_url):
     data = _download(image_url)
     if not data:
         return None, False
-    import base64
-    b64 = base64.b64encode(data).decode()
     try:
         try:
             await pg.goto("https://www.aliexpress.com/", wait_until="domcontentloaded", timeout=35000)
         except Exception:
             return None, False
-        await pg.wait_for_timeout(1500)
+        await pg.wait_for_timeout(1800)
         await _dismiss_overlays(pg)
         if _ali_blocked(pg):
             return None, True
-        # Ouvre le modal de recherche par image (clic camera). Erreurs avalees (le modal
-        # peut deja intercepter le clic => peu importe, on injecte ensuite).
+        # Ouvre le modal de recherche par image (clic camera) => fait apparaitre l'input[type=file]
+        # natif. Erreurs avalees (le modal peut deja intercepter le clic => on cherche l'input apres).
         for sel in _PIC_BTN.split(", "):
             try:
                 el = await pg.query_selector(sel)
                 if el:
-                    await el.click(timeout=1200); await pg.wait_for_timeout(500); break
+                    await el.click(timeout=1200); await pg.wait_for_timeout(700); break
             except Exception:
                 pass
-        # UPLOAD ROBUSTE: AliExpress n'expose pas toujours d'input[type=file] (zone drag-drop).
-        # On injecte donc l'image (base64 -> File -> DataTransfer) de DEUX facons:
-        #  1) si un input[type=file] existe => on lui assigne le fichier + event 'change';
-        #  2) sinon on simule un DRAG-DROP humain (dragenter/dragover/drop) sur la zone du modal.
-        # Aucun fichier disque, aucun CORS (l'image vient des bytes en base64).
-        try:
-            ok = await pg.evaluate(_ALI_UPLOAD_JS, b64)
-        except Exception:
-            ok = False
-        if not ok:
+        # UPLOAD REEL (methode prouvee, = ce que thieve/shopbysnap font): on assigne les bytes
+        # image au VRAI input[type=file] via set_input_files. AliExpress uploade vers son OSS
+        # (ae-image-search) et NAVIGUE vers /w/wholesale-.html?isNewImageSearch=y&imageId=...
+        # => vrai moteur visuel Alibaba (deep-features), prix exacts, product_id. L'ancien
+        # DragEvent simule etait IGNORE par AliExpress (=> produits tendance sans rapport).
+        inp = None
+        for _ in range(6):                  # l'input peut apparaitre apres le clic camera
+            inp = await pg.query_selector('input[type="file"], input[accept*="image"]')
+            if inp:
+                break
+            await pg.wait_for_timeout(400)
+        if not inp:
             return None, False
-        # AliExpress navigue vers une page resultats image (scene=image_search). Les cartes
-        # se chargent en lazy-load => on attend le passage en mode image_search, on re-ferme
-        # les overlays (popup login/region apparait souvent APRES navigation), puis on scrolle
-        # et parse en accumulant (recall max). ~15s borne.
+        try:
+            await inp.set_input_files(files=[{
+                "name": "search.jpg", "mimeType": "image/jpeg", "buffer": data}])
+        except Exception:
+            return None, False
+        # AliExpress navigue vers la page resultats image (URL isNewImageSearch / imageId). Les
+        # cartes se chargent en lazy-load => on attend la navigation, on re-ferme les overlays
+        # (popup login/region apparait souvent APRES), puis on scrolle et parse en accumulant.
         dismissed_again = False
-        for k in range(14):                 # ~10s max
+        for k in range(18):                 # ~13s max
             await pg.wait_for_timeout(700)
             if _ali_blocked(pg):
                 return None, True
-            if not dismissed_again and "image_search" in (pg.url or "").lower():
+            u = (pg.url or "").lower()
+            if not dismissed_again and ("isnewimagesearch" in u or "image_search" in u or "imageid" in u):
                 await _dismiss_overlays(pg); dismissed_again = True
             try:
                 links = await pg.evaluate(_ALI_PARSE_JS)
@@ -721,6 +749,32 @@ _HIT_STRENGTHS = ("exact", "strong")
 def _is_hit(strength):
     return strength in _HIT_STRENGTHS
 
+# PRECISION GATE (anti faux positif). Un "strong" obtenu UNIQUEMENT sur la distance de hash
+# dans la zone tolerante (SAFE < dmin <= STRONG_MAX) est FRAGILE: c'est la zone ouverte pour
+# tolerer le changement de FOND des dropshippers, mais elle attrape aussi des produits DIFFERENTS
+# de la meme categorie (cas Bellahera artisan vitrail: dmin 24-26, sim titre ~0, page non confirmee
+# => faux positif). On NE garde un strong borderline QUE s'il est corrobore par un 2e signal:
+#   - page produit AliExpress confirmee (vraie image source identique), OU
+#   - similarite de TITRE >= _SIM_CORROB (le titre Etsy matche le produit AliExpress).
+# dmin <= SAFE (meme produit, photo differente) reste strong sans corroboration. "exact" intouche.
+try: _HASH_STRONG_SAFE = int(_os.environ.get("ALI_HASH_STRONG_SAFE", "18"))
+except Exception: _HASH_STRONG_SAFE = 18
+try: _SIM_CORROB = float(_os.environ.get("ALI_SIM_CORROB", "0.30"))
+except Exception: _SIM_CORROB = 0.30
+def _precision_gate(d):
+    """Degrade en 'weak' un strong borderline non corrobore (hash seul, zone tolerante).
+    Mute le dict en place et retourne d. Appeler APRES avoir pose page_confirmed."""
+    if d.get("strength") != "strong":
+        return d
+    hd = d.get("hash_dist")
+    if hd is None or hd <= _HASH_STRONG_SAFE:
+        return d                                    # zone sure: meme produit, garde strong
+    if d.get("page_confirmed") or (d.get("sim") or 0.0) >= _SIM_CORROB:
+        return d                                    # corrobore (page OU titre) => garde strong
+    d["strength"] = "weak"; d["points"] = _POINTS["weak"]
+    d["gated"] = True                               # trace: borderline non corrobore degrade
+    return d
+
 def _dedup_unique(results):
     """Normalisation (point 3): AliExpress reposte le MEME produit (angles differents,
     vendeurs multiples). On regroupe les cartes a titre quasi-identique (sim >= 0.7) pour
@@ -817,6 +871,7 @@ async def _check_lens(pg, prod):
                     dmin = dpage; vr = True
             d = _build_detail(title, results, "aliexpress", verified=vr, dmin=dmin)
             d["page_confirmed"] = bool(conf)
+            _precision_gate(d)
             if _is_hit(d.get("strength")):
                 return (True, "image", d)
     # 2) Yandex sur chaque image (2e moteur, recall AliExpress superieur)
@@ -829,6 +884,7 @@ async def _check_lens(pg, prod):
             if ry:
                 ok, vr, dmin = await _verified(img, ry)
                 d = _build_detail(title, ry, "aliexpress", verified=vr, dmin=dmin)
+                _precision_gate(d)
                 if _is_hit(d.get("strength")):
                     return (True, "yandex", d)
     if captcha:                         # aucun hit ET captcha => via=captcha (=> retry proxy rotate)
@@ -936,6 +992,20 @@ async def _check_native(pg, prod):
     imgs = [u for u in (prod.get("image_urls") or [prod.get("image_url")]) if u][:2]
     if not (NATIVE_FALLBACK and imgs):
         return (False, "image", {"n": 0})
+    global _native_count, _native_last
+    if _native_count >= NATIVE_MAX:       # cap atteint => on protege le compte, plus de native
+        return (False, "image", {"n": 0, "native_capped": True})
+    # SERIALISATION + JITTER: une seule recherche native a la fois, espacee d'un delai humain.
+    # Evite le pattern bot (uploads paralleles/rafale) qui declenche captcha Datadome / flag compte.
+    async with _native_lock():
+        gap = NATIVE_MIN_GAP - (time.time() - _native_last)
+        if gap > 0:
+            await asyncio.sleep(gap + _rnd.uniform(0.5, 2.0))   # jitter humain
+        _native_count += 1
+        _native_last = time.time()
+        return await _check_native_inner(pg, prod, title, imgs)
+
+async def _check_native_inner(pg, prod, title, imgs):
     # essaie jusqu'a 2 images: si la 1re est captcha Datadome (variable), la 2e passe souvent
     for img in imgs:
         try:
@@ -946,11 +1016,37 @@ async def _check_native(pg, prod):
             ok, vr, dmin = await _verified(img, nat)
             if ok:
                 d = _build_detail(title, ok, "aliexpress_native", verified=vr, dmin=dmin)
+                _precision_gate(d)
                 if _is_hit(d.get("strength")):       # HIT seulement si IMAGE confirmee
                     return (True, "native", d)
-        if not blocked:
-            break                       # pas de captcha mais 0 resultat => 2e image inutile
+        if blocked:
+            # CAPTCHA Datadome sur TON compte => SECURITE: on coupe TOUT native pour le reste
+            # du run (force le cap atteint). On n'insiste pas => pas d'escalade anti-bot/flag.
+            # Lens (par URL, sans compte) prend le relais.
+            global _native_count
+            _native_count = NATIVE_MAX
+            return (False, "image", {"n": 0, "native_blocked": True})
+        break                           # pas de captcha mais 0 resultat => 2e image inutile
     return (False, "image", {"n": 0})
+
+async def _check_all(pg, prod):
+    """Orchestre les moteurs sur UNE page: Google Lens d'abord (rapide, par URL), puis si
+    miss => recherche image NATIVE AliExpress (set_input_files, vrai moteur Alibaba + prix
+    exacts). Retourne le 1er HIT confirme; sinon garde le meilleur signal (ex: texte).
+    - captcha/no_image Lens => on n'enchaine PAS le native (inutile / page a problemes).
+    - Lens trouve un signal texte mais pas de hit image => on tente le native; s'il rate,
+      on renvoie le signal texte de Lens (recall preserve, etsy_core combine avec l'IA)."""
+    hit, via, detail = await _check_lens(pg, prod)
+    if hit or via in ("captcha", "no_image", "erreur"):
+        return hit, via, detail
+    if NATIVE_FALLBACK:
+        try:
+            nhit, nvia, ndetail = await _check_native(pg, prod)
+        except Exception:
+            nhit, nvia, ndetail = False, "image", {}
+        if nhit:
+            return nhit, nvia, ndetail
+    return hit, via, detail            # pas de hit native => garde le signal Lens (texte/weak)
 
 async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test_all=False):
     res = {"checked": 0, "hits": 0, "total": len(products), "via": {}, "matches": []}
@@ -962,6 +1058,13 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
     # "unusual traffic"). En mode visible il ne challenge pas. On FORCE donc le mode
     # visible et on pousse la fenetre hors-ecran (comme scraper.py) pour ne pas gener.
     headless = False
+    # MASQUAGE GLOBAL: pousse hors-ecran toute fenetre navigateur d'automation, quel que soit
+    # le moteur (cdp/scrapling/patchright). Idempotent (_HIDER_STARTED) => 1 seul thread.
+    # L'utilisateur ne doit PAS voir d'onglets/pages s'ouvrir pendant le scraping.
+    try:
+        import scraper as _scr; _scr.start_window_hider()
+    except Exception:
+        pass
     import os as _os3
     try: conc = max(1, int(_os3.environ.get("ALI_CONC", "3")))
     except Exception: conc = 3
@@ -1032,7 +1135,7 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
                 async def act(page):
                     try:
                         await _inject_cookies_once(page)
-                        holder["r"] = await _check_lens(page, prod)
+                        holder["r"] = await _check_all(page, prod)
                     except Exception: holder["r"] = (False, "erreur", {})
                     return page
                 try:
@@ -1068,7 +1171,7 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
                 try:
                     pg = await ctx.new_page()
                     await _inject_cookies_once(pg)
-                    return prod, await _check_lens(pg, prod)
+                    return prod, await _check_all(pg, prod)
                 except Exception:
                     return prod, (False, "erreur", {})
                 finally:
@@ -1101,7 +1204,7 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
                 pg = None
                 try:
                     pg = await ctx.new_page()   # peut echouer si le Chrome lache la connexion
-                    return prod, await _check_lens(pg, prod)
+                    return prod, await _check_all(pg, prod)
                 except Exception:
                     return prod, (False, "erreur", {})
                 finally:

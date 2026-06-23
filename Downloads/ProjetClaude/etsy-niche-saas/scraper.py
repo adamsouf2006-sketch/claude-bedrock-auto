@@ -17,9 +17,117 @@ try:
 except Exception:
     SCRAPLING_OK = False
 
-SESSION_PAGES = 6          # pages paralleles dans le navigateur (concurrence)
-SEARCH_WAIT = 4000         # attente JS page recherche (challenge anti-bot)
-SHOP_WAIT = 2000           # attente JS page boutique
+SESSION_PAGES = 10         # pages paralleles dans le navigateur (concurrence) — + haut =
+                           # + vite pour charger search-pages + boutiques en parallele
+SEARCH_WAIT = 3500         # attente JS page recherche (challenge anti-bot)
+SHOP_WAIT = 1600           # attente JS page boutique
+
+# ---- anti-blocage Datadome: rotation de session + proxies optionnels --------------
+# Datadome bloque par IP + cookie de session. En recreant periodiquement le navigateur
+# (nouveau fingerprint + nouveau cookie) on REMET A ZERO le compteur de blocage => on
+# scrape beaucoup plus loin avant un vrai blocage. Avec des proxies, on tourne aussi l'IP
+# (seule vraie solution pour de gros volumes type 1000 boutiques).
+ROTATE_EVERY = 120        # fetches reussis avant rotation proactive (ajuste plus bas si proxies)
+_fetch_count = 0
+_block_streak = 0
+_rotating = False
+_proxy_idx = 0
+
+def _norm_proxy(x):
+    """Normalise un proxy vers 'http://user:pass@ip:port' (scheme OBLIGATOIRE pour
+    camoufox/playwright, sinon il l'ignore => 0 resultat). Accepte les formats:
+      ip:port:user:pass   (export Webshare)
+      user:pass@ip:port
+      ip:port
+      http(s)://...        (laisse tel quel)"""
+    x = (x or "").strip()
+    if not x:
+        return ""
+    if x.startswith("http://") or x.startswith("https://"):
+        return x
+    if "@" in x:                                   # user:pass@ip:port
+        return "http://" + x
+    parts = x.split(":")
+    if len(parts) == 4:                            # ip:port:user:pass
+        ip, port, u, pw = parts
+        return f"http://{u}:{pw}@{ip}:{port}"
+    return "http://" + x                            # ip:port
+
+def _load_proxies():
+    """Proxies optionnels: env SCRAPE_PROXIES (virgules) ou config.local.json
+    {\"proxies\": [...]}. Formats divers acceptes (voir _norm_proxy). Vide => pas de
+    proxy (rotation de session seule)."""
+    import os, json as _j
+    from pathlib import Path
+    raw = [x.strip() for x in os.environ.get("SCRAPE_PROXIES", "").split(",") if x.strip()]
+    p = Path(__file__).parent / "config.local.json"
+    if p.exists():
+        try:
+            d = _j.loads(p.read_text(encoding="utf-8-sig"))
+            raw += [x for x in (d.get("proxies") or []) if x]
+        except Exception:
+            pass
+    return [n for x in raw if (n := _norm_proxy(x))]
+_PROXIES = _load_proxies()
+# AVEC proxies: rotation plus frequente => cycle les IP, repartit la charge, aucune IP
+# flaggee. Sans proxy: rotation ne change que le cookie => moins utile, on espace.
+if _PROXIES:
+    ROTATE_EVERY = 50
+
+# ---- proxies GRATUITS (auto-recolte + validation) ---------------------------------
+# Listes publiques de proxies gratuits. ATTENTION: ce sont des IP DATACENTER => Datadome
+# (Etsy) en bloque la grande majorite. Utile en complement (volume) mais peu fiable. Les
+# proxies RESIDENTIELS payants restent la seule voie vraiment fiable.
+_FREE_PROXY_SRC = [
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=8000&country=all&ssl=all&anonymity=all",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+]
+def _fetch_free_proxy_list():
+    import urllib.request
+    got = set()
+    for u in _FREE_PROXY_SRC:
+        try:
+            d = urllib.request.urlopen(u, timeout=15).read().decode("utf-8", "replace")
+            for line in d.splitlines():
+                line = line.strip().split()[0] if line.strip() else ""
+                if ":" in line and line.count(".") == 3:
+                    got.add(line)
+        except Exception:
+            pass
+    return list(got)
+
+def _validate_proxy(p, test_url="https://www.etsy.com/", timeout=8):
+    """Un proxy n'est garde QUE s'il atteint Etsy (pas juste httpbin): c'est le vrai test
+    (Datadome). Retourne p si OK, sinon None."""
+    import urllib.request
+    try:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler(
+            {"http": "http://" + p, "https": "http://" + p}))
+        op.addheaders = [("User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124 Safari/537.36")]
+        r = op.open(test_url, timeout=timeout)
+        return p if r.status == 200 else None
+    except Exception:
+        return None
+
+def refresh_free_proxies(max_test=400, want=20, test_url="https://www.etsy.com/"):
+    """Recolte + valide des proxies gratuits CONTRE ETSY et alimente la rotation (_PROXIES).
+    Retourne la liste validee. Lent (~30-60s) et rendement faible (datacenter vs Datadome)."""
+    import concurrent.futures as cf
+    global _PROXIES
+    cand = _fetch_free_proxy_list()[:max_test]
+    ok = []
+    with cf.ThreadPoolExecutor(max_workers=60) as ex:
+        for r in ex.map(lambda p: _validate_proxy(p, test_url), cand):
+            if r:
+                ok.append(r)
+                if len(ok) >= want:
+                    break
+    if ok:
+        _PROXIES = ok
+    return ok
 
 # ---- boucle asyncio dediee (thread daemon) -----------------------------------
 _loop = None
@@ -41,35 +149,80 @@ def _run(coro):
     return asyncio.run_coroutine_threadsafe(coro, _loop).result()
 
 async def _get_session():
-    global _session
+    global _session, _proxy_idx
     if _session is None:
-        _session = AsyncStealthySession(headless=False, network_idle=True, max_pages=SESSION_PAGES)
+        kw = dict(headless=False, network_idle=True, max_pages=SESSION_PAGES)
+        if _PROXIES:                       # rotation d'IP a chaque (re)creation de session
+            kw["proxy"] = _PROXIES[_proxy_idx % len(_PROXIES)]
+            _proxy_idx += 1
+        _session = AsyncStealthySession(**kw)
         await _session.start()
         start_window_hider()   # cache la/les fenetre(s) du navigateur
     return _session
 
+async def _reset_session():
+    """Le navigateur est mort (crash camoufox: TargetClosedError / frame detached).
+    Sans reset, _session reste en cache et TOUS les fetchs suivants echouent =>
+    le scrape rend 0 boutique 'par moments'. On ferme proprement et on force la
+    recreation au prochain _get_session."""
+    global _session
+    s, _session = _session, None
+    if s is not None:
+        try: await s.close()
+        except Exception: pass
+
+def _is_dead(exc):
+    m = str(exc).lower()
+    return ("targetclosed" in m or "browser has been closed" in m or "frame was detached"
+            in m or "page, context or browser" in m or "session closed" in m
+            or "connection closed" in m)
+
 async def _afetch(url, wait, retries=2, network_idle=True):
-    """Fetch via la session; 1 retry si 403 transitoire (Datadome).
-    Timeout DUR par essai: une page Etsy peut ne jamais atteindre network_idle
-    (pub/spinner infini) => sans timeout, asyncio.gather gele tout le batch.
-    network_idle=False (+load_dom) pour les pages boutique: rapide et sans hang."""
-    s = await _get_session()
-    hard = wait / 1000.0 + 18   # secondes: attente JS + marge chargement
+    """Fetch via la session; retry si 403 transitoire (Datadome) OU si le navigateur
+    a crashe (on le recree). Timeout DUR par essai COURT: quand les proxies sont
+    epuises/bloques, chaque fetch echoue => on veut echouer VITE (pas 21s x3) pour rendre
+    le bilan rapidement. 2 essais, marge reduite."""
+    hard = wait / 1000.0 + 8    # secondes: attente JS + marge chargement (reduite)
     p = None
-    for _ in range(retries):
+    for attempt in range(retries):
         try:
+            s = await _get_session()
             p = await asyncio.wait_for(
                 s.fetch(url, wait=wait, timeout=int(hard * 1000),
                         network_idle=network_idle, load_dom=True),
                 timeout=hard + 5)
         except asyncio.TimeoutError:
             p = None
-        except Exception:
+        except Exception as e:
             p = None
+            if _is_dead(e):           # navigateur mort => on le recree avant de reessayer
+                await _reset_session()
         if p is not None and getattr(p, "status", 0) == 200:
+            await _rotate_tick(ok=True)
             return p
-        await asyncio.sleep(0.6)
+        await _rotate_tick(ok=False)               # 403/timeout => peut declencher rotation
+        await asyncio.sleep(0.6 + attempt * 0.8)   # backoff croissant
     return p
+
+async def _rotate_tick(ok):
+    """Compte les fetches et ROTATE la session (nouveau navigateur/cookie/IP) soit
+    periodiquement (anti-accumulation Datadome), soit des qu'on enchaine les blocages.
+    => on repart 'propre' et on continue a scraper au lieu de rester bloque."""
+    global _fetch_count, _block_streak, _rotating
+    if _rotating:
+        return
+    if ok:
+        _fetch_count += 1; _block_streak = 0
+        if _fetch_count % ROTATE_EVERY == 0:       # rotation proactive
+            _rotating = True
+            try: await _reset_session()
+            finally: _rotating = False
+    else:
+        _block_streak += 1
+        if _block_streak >= 6:                     # blocages soutenus => identite grillee
+            _rotating = True; _block_streak = 0
+            try: await _reset_session()
+            finally: _rotating = False
 
 # ---- masquage fenetres navigateur (Windows) ----------------------------------
 _HIDER_STARTED = False
@@ -83,10 +236,12 @@ def start_window_hider():
     user32 = ctypes.windll.user32
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
     SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
-    # scrapling pilote "Google Chrome for Testing" (classe Chrome_WidgetWin_1).
-    # On NE deplace QUE les fenetres dont le titre contient ce marqueur, pour ne
-    # pas toucher les autres fenetres Chrome de l'utilisateur.
-    MARK = "Google Chrome for Testing"
+    # scrapling pilote "Google Chrome for Testing" ; patchright (Google Lens) pilote son
+    # propre "Chromium" (titre different). On masque les DEUX. "Chrome for Testing" couvre
+    # aussi la variante sans "Google". Une fenetre automation vierge = "about:blank - ...".
+    # On NE deplace QUE les fenetres dont le titre contient un de ces marqueurs, pour ne
+    # pas toucher les fenetres Chrome normales de l'utilisateur.
+    MARKS = ("Chrome for Testing", "Chromium")
     moved = set()
     def _scan():
         def cb(hwnd, lparam):
@@ -94,7 +249,8 @@ def start_window_hider():
                 return True
             ttl = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(hwnd, ttl, 256)
-            if MARK in (ttl.value or ""):
+            t = ttl.value or ""
+            if any(m in t for m in MARKS):
                 moved.add(hwnd)
                 user32.SetWindowPos(hwnd, 0, -32000, -32000, 0, 0,
                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
@@ -104,7 +260,8 @@ def start_window_hider():
         while True:
             try: _scan()
             except Exception: pass
-            time.sleep(0.2)
+            time.sleep(0.03)   # scan tres frequent => la fenetre est poussee hors-ecran
+                               # quasi instantanement (a peine un flash a la creation)
     threading.Thread(target=worker, daemon=True).start()
 
 # ---- extraction --------------------------------------------------------------
@@ -140,6 +297,69 @@ _SALES_RE = [
     re.compile(r"([\d,]+)\s+ventes?\b", re.I),
 ]
 
+# Prix produit Etsy via JSON-LD (schema.org/Product). Etsy embarque un <script
+# type="application/ld+json"> avec soit un Product direct, soit un @graph les contenant.
+# offers.price = prix de vente. On prend la MEDIANE des produits de la page boutique
+# (robuste aux soldes / cartes promo) = base de la marge dropship (etsy_core.py:2079).
+_JSONLD_RE = re.compile(
+    r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I | re.S)
+_PRICE_NUM = re.compile(r'([0-9]+(?:[.,][0-9]{1,2})?)')
+
+def _parse_etsy_prices_ld(html):
+    """Extrait les prix produits du JSON-LD Etsy. Retourne liste de float (USD), [] si rien.
+    Gere @graph, offers direct, et priceSpecification (prix promo). Fallback <meta price>."""
+    out = []
+    for m in _JSONLD_RE.findall(html):
+        try:
+            import json
+            data = json.loads(m)
+        except Exception:
+            continue
+        # Recolte TOUS les dicts contenant une cle 'offers' (Product direct, Product dans
+        # @graph, Product dans ItemList...). Pas de filtre sur @type: Etsy change le schema
+        # et le @type peut etre absent ou typo differents => on se fie a la structure.
+        prods = []
+        def _collect(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("offers"), (dict, list)):
+                    prods.append(node)
+                for v in node.values():
+                    _collect(v)
+            elif isinstance(node, list):
+                for x in node:
+                    _collect(x)
+        _collect(data)
+        for prod in prods:
+            off = prod.get("offers")
+            if isinstance(off, list):
+                off = off[0] if off else {}
+            if not isinstance(off, dict):
+                continue
+            # priceSpecification (promo) prioritaire sur price direct
+            spec = off.get("priceSpecification")
+            if isinstance(spec, dict):
+                price = spec.get("price", spec.get("lowPrice"))
+            else:
+                price = off.get("price", off.get("lowPrice"))
+            try:
+                v = float(str(price).replace(",", "."))
+                if 0 < v < 100000:
+                    out.append(v)
+            except Exception:
+                continue
+    # Fallback: meta itemprop="price" si le JSON-LD est vide/casse
+    if not out:
+        for mm in re.finditer(r'itemprop=["\']price["\'][^>]*content=["\']([^"\']+)["\']', html, re.I):
+            pm = _PRICE_NUM.search(mm.group(1))
+            if pm:
+                try:
+                    v = float(pm.group(1).replace(",", "."))
+                    if 0 < v < 100000:
+                        out.append(v)
+                except Exception:
+                    pass
+    return out
+
 def _parse_shop(p):
     if p is None:
         return {"error": "no response"}
@@ -155,31 +375,54 @@ def _parse_shop(p):
     mo = re.search(r"(\d+)\s*months? on Etsy", txt, re.I)
     yo = re.search(r"(\d+)\s*years? on Etsy", txt, re.I)
     titles = []
+    images = []
     for a in p.css('a[href*="/listing/"]'):
         t = " ".join((a.attrib.get("title") or a.text or "").split())
         if t and len(t) > 5 and t not in titles:
             titles.append(t)
+            # image produit de la carte (pour la validation dropship par image, sans API).
+            # Etsy lazy-load: l'URL est dans src OU data-src/srcset de l'<img> de la carte.
+            iu = ""
+            for im in a.css("img"):
+                iu = (im.attrib.get("src") or im.attrib.get("data-src") or "").strip()
+                if not iu:
+                    ss = (im.attrib.get("srcset") or "").strip()
+                    iu = ss.split()[0] if ss else ""
+                if iu.startswith("http"):
+                    break
+            images.append(iu if iu.startswith("http") else "")
     months = mo.group(1) if mo else None
     years = yo.group(1) if yo else None
+    # Prix de vente Etsy (mediane des produits de la page) via JSON-LD schema.org/Product.
+    # Base de la marge dropship (prix vente / prix achat AliExpress). 0 credit API.
+    prices = _parse_etsy_prices_ld(html)
+    price = round(sorted(prices)[len(prices) // 2], 2) if prices else None
     return {"sold": sold,
             "months": int(months) if months else (int(years) * 12 if years else None),
             "is_under_1y": months is not None,
-            "titles": titles[:30]}
+            "price": price,
+            "titles": titles[:48], "images": images[:48]}
 
 # ---- API sync ----------------------------------------------------------------
 def scrape_search_shops(keyword, pages=1, page_start=1):
     """Pages de recherche -> [(shop_name, sample_title)]. 0 API."""
     out, seen = [], set()
     async def go():
-        res = []
-        for pg in range(page_start, page_start + pages):
-            kw = keyword.strip().replace(" ", "+") or "handmade"
+        kw = keyword.strip().replace(" ", "+") or "handmade"
+        # Fetch des pages de recherche EN PARALLELE (avant: sequentiel => chaque attente
+        # ~4s bloquait la suivante). network_idle=False: une page recherche Etsy n'atteint
+        # JAMAIS network_idle (pub/tracking en boucle); load_dom suffit pour parser.
+        async def one(pg):
             url = f"https://www.etsy.com/search?q={kw}&page={pg}&ref=search"
             try:
-                p = await _afetch(url, SEARCH_WAIT)
+                p = await _afetch(url, SEARCH_WAIT, network_idle=False)
             except Exception:
-                continue
-            res.extend(_parse_search(p))
+                return []
+            return _parse_search(p)
+        pages_res = await asyncio.gather(*[one(pg) for pg in range(page_start, page_start + pages)])
+        res = []
+        for r in pages_res:
+            res.extend(r)
         return res
     if not SCRAPLING_OK:
         return out

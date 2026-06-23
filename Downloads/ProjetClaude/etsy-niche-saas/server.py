@@ -75,7 +75,13 @@ class H(BaseHTTPRequestHandler):
             shop = q.get("shop", [""])[0]
             smode = q.get("mode", ["live"])[0]
             target = gi2("target_count", 30)
-            mxa = gi2("max_api", 0) or (target * 6 + 200)
+            # BUDGET INSISTANT: le clone finder ne doit PAS s'arreter sur un petit budget (avant
+            # target*6+200 = 260 credits pour 10 boutiques => il rendait 1 et stoppait). On lui
+            # donne un gros budget pour PAGINER LOIN sur Etsy jusqu'a atteindre la cible. Borne a
+            # 80% du quota restant (garde une reserve), large minimum 1500. Override via max_api.
+            try: _rem = int(core.quota_remaining())
+            except Exception: _rem = 5000
+            mxa = gi2("max_api", 0) or min(max(target * 60, 1500), max(int(_rem * 0.8), 300))
             if u.path == "/api/similar_stream":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")

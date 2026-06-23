@@ -213,6 +213,51 @@ def ai_photo_drop_signal(image_urls):
     except Exception:
         return None
 
+def _vision_batch_score(image_urls):
+    """Note dropship MOYENNE 0..1 d'un LOT de photos produit (1 image = 1 produit). On demande
+    au modele de juger CHAQUE photo et de renvoyer la moyenne. None si echec."""
+    imgs = [u for u in (image_urls or []) if u]
+    if not imgs:
+        return None
+    prompt = (
+        "Voici " + str(len(imgs)) + " photos, UNE PAR PRODUIT, d'une meme boutique Etsy. "
+        "Pour CHAQUE photo, evalue la probabilite (0 a 1) que ce soit une photo de "
+        "REVENDEUR/dropship (studio parfait, fond blanc/uni detoure, lumiere artificielle, image "
+        "trop nette/lisse/IA, packaging usine, photo de fournisseur) plutot qu'une photo d'ARTISAN "
+        "(amateur, lumiere naturelle, decor reel, mains, atelier, imperfections).\n"
+        "Renvoie la LISTE des notes puis leur MOYENNE, UNIQUEMENT en JSON: "
+        "{\"scores\":[0.0,...],\"avg\":0.0}"
+    )
+    txt = _ai_vision_call(prompt, imgs, max_tokens=400)
+    if not txt:
+        return None
+    try:
+        txt = txt[txt.find("{"): txt.rfind("}") + 1]
+        d = json.loads(txt)
+        sc = [float(x) for x in (d.get("scores") or []) if x is not None]
+        if sc:
+            return sum(sc) / len(sc)
+        return max(0.0, min(1.0, float(d.get("avg"))))
+    except Exception:
+        return None
+
+def shop_photo_drop_avg(image_urls, batch=6):
+    """Note dropship MOYENNE sur TOUTES les photos produit d'une boutique (1 photo/produit).
+    Traite par lots de `batch` (un appel vision par lot) puis moyenne ponderee par le nombre de
+    photos. Retourne (avg 0..1, n_photos) ou (None, 0) si vision indispo/echec total."""
+    urls = [u for u in (image_urls or []) if u]
+    if not urls or not vision_available():
+        return (None, 0)
+    tot, n = 0.0, 0
+    for i in range(0, len(urls), batch):
+        chunk = urls[i:i + batch]
+        a = _vision_batch_score(chunk)
+        if a is not None:
+            tot += a * len(chunk); n += len(chunk)
+    if n == 0:
+        return (None, 0)
+    return (round(tot / n, 3), n)
+
 # ---- Taxonomie de niches FIXE (large) -----------------------------------------
 # Probleme avant: l'IA inventait un nom hyper-specifique par boutique ("Couvercles
 # boites tissu", "Figurines laiton vintage") => 1 boutique par niche, impossible
@@ -246,6 +291,7 @@ def _ai_refine_chunk(chunk, query=""):
     fournie, l'IA juge AUSSI la pertinence semantique vs la recherche (ex: 'support'
     = un support/socle, PAS 'emotional support')."""
     items = [{"id": s["id"], "age_mois": s.get("months"), "ventes_total": s.get("sold"),
+              "pays": s.get("country"),
               "titres": (s.get("titles") or [s.get("sample", "")])[:60]}
              for s in chunk]
     rel_rule = ""
@@ -325,6 +371,12 @@ def _ai_refine_chunk(chunk, query=""):
         "un catalogue COHERENT et personnalise = quasi toujours un vrai artisan (baisse le score, "
         "meme si elle source une base: un graveur sur bambou depuis 7 ans n'est PAS un dropshipper).\n"
         "   * Ne te fie pas au volume de ventes seul: un artisan etabli vend beaucoup AUSSI.\n"
+        "   * PAYS (champ 'pays') = signal TRES FORT. Un vendeur de produits PHYSIQUES (bois, "
+        "ceramique, textile, metal...) base en CHINE (CN), HONG KONG (HK), TAIWAN (TW) ou MACAO "
+        "(MO) qui ecrit 'handmade/handcrafted/natural/artisan' est presque TOUJOURS un "
+        "dropshipper/usine deguise (sourcing AliExpress/Alibaba direct). NE te fais PAS berner par "
+        "les mots 'handcrafted/natural wood': pour CN/HK => dropship >= 0.85. Les vrais artisans "
+        "Etsy de produits physiques sont quasi tous en US/EU/UK/CA/AU.\n"
         "- coherent (bool) [OBLIGATOIRE, ne l'omets JAMAIS]: regarde l'ENSEMBLE des titres et "
         "decide. true = TOUS les produits relevent d'UNE meme famille/savoir-faire (ex: que des "
         "ustensiles bois graves, que des bougies) meme avec des variantes => boutique focalisee, "
@@ -668,6 +720,64 @@ def catalog_coherence(titles, sample=30):
     except Exception: thr = 0.07
     return (avg >= thr, round(avg, 3))
 
+def _content_tokens(text):
+    import re as _re
+    return [w for w in _re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in _COH_STOP]
+
+def dominant_tokens(titles, k=8):
+    """Les k tokens de produit/matiere les + frequents du catalogue source. Singularise pour
+    regrouper pluriels. Sert a juger la PERTINENCE d'une boutique candidate (vend-elle le meme
+    type de produit ?)."""
+    from collections import Counter
+    c = Counter()
+    for t in (titles or []):
+        for w in set(_content_tokens(t)):
+            w = w[:-1] if (len(w) > 4 and w.endswith("s")) else w
+            c[w] += 1
+    return {w for w, _ in c.most_common(k)}
+
+def relevance_fraction(titles, top_set):
+    """Part des titres d'une boutique qui contiennent AU MOINS un token dominant de la source.
+    1.0 = catalogue 100% sur le meme theme ; ~0 = hors-niche (ex: whiteboards dans une niche
+    cuisine-bois). top_set vide => 1.0 (pas de filtre)."""
+    if not top_set:
+        return 1.0
+    titles = [t for t in (titles or []) if t]
+    if not titles:
+        return 0.0
+    hit = 0
+    for t in titles:
+        toks = set()
+        for w in _content_tokens(t):
+            toks.add(w); toks.add(w[:-1] if (len(w) > 4 and w.endswith("s")) else w)
+        if toks & top_set:
+            hit += 1
+    return hit / len(titles)
+
+# Pays d'ou un vendeur de produits PHYSIQUES "handmade" sur Etsy est quasi toujours un
+# dropshipper/usine (sourcing direct AliExpress/Alibaba). Reglable via env DROPSHIP_COUNTRIES
+# (codes ISO separes par virgule).
+_DROPSHIP_COUNTRIES = set((os.environ.get("DROPSHIP_COUNTRIES", "CN,HK,TW,MO") or "")
+                          .upper().replace(" ", "").split(","))
+
+def niche_match_count(titles, top_set):
+    """Nombre de produits (titres) de la boutique qui relevent VRAIMENT de la niche source
+    (contiennent >=1 token dominant de la source). Sert au gate 'au moins 10 produits dans la
+    niche' (regle utilisateur: on refuse les boutiques qui melangent les niches)."""
+    if not top_set:
+        return len([t for t in (titles or []) if t])
+    n = 0
+    for t in (titles or []):
+        if not t:
+            continue
+        toks = set()
+        for w in _content_tokens(t):
+            toks.add(w); toks.add(w[:-1] if (len(w) > 4 and w.endswith("s")) else w)
+        if toks & top_set:
+            n += 1
+    return n
+
 def profile_drop_score(s):
     """Signal dropship base sur le PROFIL boutique (independant de Lens, qui rate les produits
     chinois generiques): combine le jugement IA titres (ai_dropship), la COHERENCE du catalogue
@@ -708,6 +818,14 @@ def profile_drop_score(s):
         score = min(score, 0.30)             # 2-4 ans = improbable
     else:
         score = min(score, 0.20)             # > 4 ans = quasi jamais drop
+    # 3) PAYS = SIGNAL DOMINANT (overrides tout). Un VRAI artisan de produits PHYSIQUES (bois,
+    # ceramique, textile...) sur Etsy n'est quasi JAMAIS en Chine/Hong-Kong: ces vendeurs CN/HK
+    # qui affichent "handcrafted/handmade/natural wood" sont des dropshippers/usines deguises
+    # (cas Kitchenova HK, OritFinds CN). L'IA (ai_dropship 0.2) et Lens (photos custom) se font
+    # berner; le pays les trahit. Plancher TRES haut, independant de l'age (un CN de 5 ans = drop).
+    country = (s.get("country") or "").strip().upper()
+    if country in _DROPSHIP_COUNTRIES:
+        score = max(score, 0.90)
     return round(max(0.0, min(1.0, score)), 2)
 
 def ai_enrich_shops(shops, f):
@@ -815,9 +933,23 @@ def _update_quota(rem, lim):
 
 # ---------------- cache ----------------
 def _load():
-    return json.loads(SHOP_CACHE.read_text(encoding="utf-8-sig")) if SHOP_CACHE.exists() else {}
+    # ROBUSTE: un cache vide/tronque (ex: process tue pendant _save) ne doit PAS crasher
+    # tout l'app. On renvoie {} et on met le fichier corrompu de cote (.bad) pour debug.
+    if not SHOP_CACHE.exists():
+        return {}
+    try:
+        txt = SHOP_CACHE.read_text(encoding="utf-8-sig")
+        return json.loads(txt) if txt.strip() else {}
+    except (ValueError, OSError):
+        try: SHOP_CACHE.replace(SHOP_CACHE.with_suffix(SHOP_CACHE.suffix + ".bad"))
+        except Exception: pass
+        return {}
 def _save(d):
-    SHOP_CACHE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    # ATOMIQUE: ecrit dans un .tmp puis remplace => jamais de fichier tronque si on est tue
+    # en plein ecriture (cause du crash _load precedent).
+    tmp = SHOP_CACHE.with_suffix(SHOP_CACHE.suffix + ".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(SHOP_CACHE)
 
 def _name_index(cache):
     """nom_minuscule -> cle. Sert a dedupliquer entre modes (api/scrape) ou
@@ -2024,7 +2156,11 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # max_rounds + plafond de credits pour ne pas tourner a l'infini si le filon est vide.
     f["no_match_budget"] = 10 ** 9          # desactive l'arret anticipe "plus de resultat"
     per_budget = max(200, max_api // max(len(kws), 1))
-    max_rounds = int(f.get("similar_max_rounds", 0)) or (12 if not scrape_mode else 4)
+    # ROUNDS: on PAGINE LOIN (le curseur avance a chaque tour => nouvelles pages Etsy). Borne
+    # haute mais la boucle s'auto-termine quand un tour entier n'ajoute AUCUNE nouvelle boutique
+    # (round_added==0 => filon vraiment epuise) ou que le budget credits est atteint. 50 tours
+    # x 100 listings/page couvre la quasi-totalite des pages Etsy d'un mot-cle.
+    max_rounds = int(f.get("similar_max_rounds", 0)) or (50 if not scrape_mode else 8)
     # GATE DROPSHIP: on ne garde QUE les boutiques que l'IA juge dropship-ables (produits
     # industriels revendables). L'utilisateur veut SEULEMENT du dropship, pas les artisans.
     # Seuil ai_dropship (rapide, sans navigateur). On continue de chercher (rounds) jusqu'a
@@ -2058,12 +2194,21 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
             seen[sid] = s; merged.append(s); added += 1
         return added
 
+    # COLLECTE SUR-ECHANTILLONNEE: le drop est RARE dans une niche artisanale; pour rendre N
+    # boutiques IRREPROCHABLES il faut beaucoup de candidats a valider. On collecte un large pool
+    # de candidats plausibles (gate profil tolerant), borne par max_rounds.
+    # VITESSE: en scrape chaque candidat = 1 catalogue complet scrape (browser, lent). On limite
+    # le sur-echantillonnage (avant target*8 => 24 boutiques scrapees pour target=3 => timeout).
+    # target*4 plafonne le pool tout en gardant de la marge pour le drop rare. Reglable.
+    pool_mult = int(f.get("pool_mult", 0)) or 5
+    pool_target = min(max(target_count * pool_mult, target_count + 12), target_count + 80)
+    confirmed_box = {"n": []}                # compteur partage pour la progression live
     rnd = 0
-    while len(merged) < target_count and rnd < max_rounds and not _stopped(stop):
+    while len(merged) < pool_target and rnd < max_rounds and not _stopped(stop):
         rnd += 1
         round_added = 0
         for kw in kws:
-            if len(merged) >= target_count or _stopped(stop):
+            if len(merged) >= pool_target or _stopped(stop):
                 break
             if scrape_mode:
                 sub = run_scrape(keyword=kw, target_count=per_target,
@@ -2072,23 +2217,110 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
                 sub = run_discovery(keyword=kw, target_count=per_target,
                                     max_api=per_budget, filters=dict(f), progress=progress, stop=stop)
             round_added += absorb(sub)
-            if progress: progress(len(merged), 0)
+            if progress: progress(len(confirmed_box["n"]), target_count)
         if round_added == 0:                # un tour entier sans NOUVELLE boutique => filon epuise
             break
-    # TRI: dropship confirme d'abord (2), indetermine ensuite (1), artisan/non-dropship en
-    # dernier (0); a rang egal, les meilleures ventes/mois en tete. => l'utilisateur voit les
-    # vraies cibles dropship en haut, sans perdre les autres similaires.
-    def _drop_rank(s):
-        dc = s.get("dropship_confirmed")
-        if dc is True:  return 2
-        if dc is False: return 0
-        # pas de validation image: on classe par le signal PROFIL (ai_dropship + coherence + age).
-        ad = s.get("ai_profile_drop")
-        if ad is None: ad = s.get("ai_dropship")
-        return 2 if (ad is not None and ad >= 0.5) else 1
-    merged.sort(key=lambda x: (-_drop_rank(x),
-                               -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
-                               -x.get("rate", 0)))
+
+    # DEUX GATES DURS (regle utilisateur), candidats tries par profil drop (les + prometteurs d'abord):
+    #   1) NICHE: au moins `niche_min` produits de la boutique relevent de la niche source. On RECUPERE
+    #      TOUS les titres pour compter (refus des boutiques qui melangent les niches).
+    #   2) DROP: on analyse les PHOTOS de TOUS les produits (vision), note 0..1 par produit; la
+    #      MOYENNE doit etre >= `photo_avg_min` pour accepter. Exception: pays CN/HK/TW/MO = drop
+    #      quasi-certain (override). Sans vision: repli profil (age/pays/coherence) >= drop_strict_min.
+    src_top = dominant_tokens(titles, k=10)
+    # GATE NICHE (RIGUEUR): on exige une PROPORTION du catalogue dans la niche source, pas un
+    # comptage absolu. Une boutique de sacs maquillage trouvee par hasard sur "spice grinder" a
+    # ~0% de recouvrement => rejetee. niche_ratio_min = part minimale du catalogue en-niche.
+    # niche_min = plancher absolu anti-fluke (eviter de valider sur 1 titre tangent).
+    niche_min = int(f.get("niche_min_products", 3))
+    niche_ratio_min = float(f.get("niche_ratio_min", 0.5))
+    photo_avg_min = float(f.get("photo_avg_min", 0.5))
+    strict_min = float(f.get("drop_strict_min", 0.6))
+    # VITESSE: 1 appel vision / 6 photos. 24 photos = 4 appels/boutique. 12 photos (2 appels)
+    # suffit pour une MOYENNE representative du catalogue. Reglable via photo_max.
+    photo_cap = int(f.get("photo_max", 12))
+    # PLAFOND VALIDATION: dernier verrou avant le verdict. A 25 il coupait la validation avant
+    # d'avoir teste tout le pool elargi (=> rendait peu de drop sur 90 candidats collectes). On le
+    # cale sur la cible (target*5, plancher 40) pour VALIDER tout le pool jusqu'a atteindre N drops.
+    val_budget = int(f.get("ali_validate_max", 0) or max(target_count * 5, 40))
+    use_vis = bool(f.get("use_vision"))
+    cands = sorted(merged, key=lambda x: -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0))
+    confirmed = []
+    validated_n = 0
+    relevant_n = 0
+    for s in cands:
+        if len(confirmed) >= target_count or _stopped(stop) or validated_n >= val_budget:
+            break
+        sid = s.get("id")
+        # 1) TITRES COMPLETS (pour compter les produits niche + analyser les photos)
+        full_titles = s.get("titles") or []
+        if str(sid).isdigit() and len(full_titles) < 20:
+            try:
+                ft = fetch_shop_titles(sid, 100)
+                if ft: full_titles = ft; s["titles"] = ft
+            except Exception: pass
+        cat_n = len([t for t in full_titles if t])
+        nc = niche_match_count(full_titles, src_top)
+        ratio = nc / max(cat_n, 1)
+        s["niche_count"] = nc; s["catalog_n"] = cat_n; s["niche_ratio"] = round(ratio, 2)
+        # GATE NICHE DUR: catalogue assez fourni + proportion en-niche suffisante + plancher absolu.
+        if cat_n < niche_min:
+            s["reject"] = "catalogue trop maigre (%d produits)" % cat_n
+            continue
+        if nc < niche_min or ratio < niche_ratio_min:
+            s["reject"] = "hors-niche (%d/%d = %d%% en-niche < %d%%)" % (
+                nc, cat_n, round(100 * ratio), round(100 * niche_ratio_min))
+            continue
+        relevant_n += 1
+        if not s.get("sample") and full_titles:
+            s["sample"] = full_titles[0]
+        s["ai_profile_drop"] = profile_drop_score(s)   # recalcul sur le catalogue complet
+        # 2) PHOTOS DES PRODUITS -> moyenne. Live: images via API listings (id numerique).
+        #    Scrape: on a deja scrape les images du catalogue (s["images"]) => on les reutilise
+        #    (avant: vision sautait en scrape car id non-numerique => "0 analysees" + repli profil
+        #    trop laxiste qui validait des jeunes boutiques hors-drop).
+        photo_avg, nph = (None, 0)
+        if use_vis:
+            try:
+                urls = []
+                if str(sid).isdigit():
+                    ids = fetch_shop_listing_ids(sid, photo_cap)
+                    if ids: api_used += 1
+                    imgs, _ = fetch_listing_images(ids, per=1, with_prices=False) if ids else ({}, {})
+                    urls = [u for lid in ids for u in ((imgs.get(lid) or [None])[:1]) if u]
+                else:
+                    urls = [u for u in (s.get("images") or []) if u][:photo_cap]
+                if urls:
+                    photo_avg, nph = shop_photo_drop_avg(urls)
+            except Exception: pass
+        s["photo_drop_avg"] = photo_avg; s["photo_n"] = nph
+        validated_n += 1
+        # 3) DECISION DROP (RIGUEUR: preuve requise, pas de validation sur profil seul quand la
+        #    vision est demandee). Ordre: pays-drop > preuve photos > repli profil SANS vision.
+        country = (s.get("country") or "").upper()
+        if country in _DROPSHIP_COUNTRIES:
+            drop = True                                # pays = drop quasi-certain (override)
+        elif photo_avg is not None:
+            drop = photo_avg >= photo_avg_min          # critere user: moyenne photos >= seuil
+        elif use_vis:
+            # vision demandee mais AUCUNE image analysable => on NE peut PAS confirmer le drop.
+            # On rejette (rigueur) au lieu de retomber sur le profil (qui validait a tort).
+            drop = False
+            s["reject"] = "drop non prouve (aucune photo analysable)"
+        else:
+            drop = (s.get("ai_profile_drop") or 0) >= strict_min   # repli si vision desactivee
+        s["dropship_confirmed"] = bool(drop)
+        # score d'affichage unifie: moyenne photos si dispo, sinon profil (pays/age/coherence)
+        disp = photo_avg if photo_avg is not None else (s.get("ai_profile_drop") or 0)
+        s["dropship_score"] = round(disp, 2); s["dropship_score100"] = round(100 * disp)
+        if drop:
+            s["relevance"] = round(nc / max(s["catalog_n"], 1), 2)
+            confirmed.append(s)
+            confirmed_box["n"] = confirmed
+            if progress: progress(len(confirmed), target_count)
+    # TRI final: moyenne photos drop (ou profil) desc, puis ventes/mois.
+    confirmed.sort(key=lambda x: (-(x.get("photo_drop_avg") if x.get("photo_drop_avg") is not None
+                                    else (x.get("ai_profile_drop") or 0)), -x.get("rate", 0)))
     res = {
         "source": {
             "id": src_id, "name": src.get("name"), "url": src.get("url"),
@@ -2103,53 +2335,20 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
         "ai_available": ai_available(),
         "api_used": api_used,
         "listing_calls": listing_calls,
-        "matched": len(merged),
+        "matched": len(confirmed),
+        "requested": target_count,
+        "candidates_seen": len(merged),
+        "relevant_candidates": relevant_n,
+        "validated_n": validated_n,
+        "exhausted": len(confirmed) < target_count,
         "quota_remaining": _remaining["today"],
         "stopped": _stopped(stop),
         "rounds": rnd,
         "clusters": [],
-        "shops": merged,
+        "shops": confirmed,
     }
     out = finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
-    # VALIDATION DROPSHIP CIBLEE: on valide par image/texte SEULEMENT les boutiques REELLEMENT
-    # AFFICHEES (finalize re-selectionne/re-trie => il faut valider APRES, sinon on validait
-    # d'autres boutiques que celles montrees => colonnes dropship vides). Plafond pour borner le
-    # temps (1 Chrome). On annote chaque boutique montree (pas de filtre dur).
-    shown = out.get("shops") or []
-    if f.get("validate_ali_final", True) and shown and not _stopped(stop):
-        cap = int(f.get("ali_validate_max", 8) or 8)
-        try:
-            nprod = int(f.get("ali_products", 4) or 4)
-            minm = int(f.get("ali_min_match", 1) or 1)
-            validate_shops_ali(shown[:cap], nprod, minm, stop=stop,
-                                use_vision=bool(f.get("use_vision")))
-            out["ali_used"] = True
-        except Exception:
-            pass
-    # FILTRE DUR + SEUIL SOUPLE: l'utilisateur veut SEULEMENT des boutiques qui font du drop.
-    # On JETTE les artisans clairs, on GARDE drop confirme + drop probable. Une boutique passe si:
-    #   - dropship_confirmed is True (consensus Lens/texte+IA)  -> garde
-    #   - dropship_confirmed is False (preuve artisan)          -> JETTE
-    #   - non validee (None): on retombe sur les signaux IA/score: garde si l'IA titres
-    #     OU la vision OU le score dropship indiquent du drop (seuil souple drop_keep_min, def 0.45).
-    # Garde-fou anti-0-resultat: si TOUT est jete (ex: validation bloquee, niche limite), on
-    # retombe sur le tri annote (montre tout) plutot que de renvoyer une liste vide.
-    keep_min = float(f.get("drop_keep_min", 0.45))
-    def _is_drop(s):
-        dc = s.get("dropship_confirmed")
-        if dc is True:  return True
-        if dc is False: return False
-        ad = s.get("ai_profile_drop"); pd = s.get("ai_photo_drop"); sc = s.get("dropship_score")
-        sig = [x for x in (ad, pd, sc) if x is not None]
-        return bool(sig) and max(sig) >= keep_min
-    only_drop = [s for s in shown if _is_drop(s)]
-    if only_drop:                              # au moins 1 vrai drop => filtre dur applique
-        out["shops"] = only_drop
-        out["matched"] = len(only_drop)
-        out["filtered_non_drop"] = len(shown) - len(only_drop)
-    else:                                      # rien de confirme: ne pas renvoyer vide
-        out["filtered_non_drop"] = 0
-        out["drop_filter_fallback"] = True
+    out["matched"] = len(out.get("shops") or [])
     return out
 
 # ---------------- validation dropship AliExpress ----------------

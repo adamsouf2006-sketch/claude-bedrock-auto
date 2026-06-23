@@ -47,8 +47,12 @@ def launch(port=PORT, profile=PROFILE, url="https://lens.google.com/", hidden=Fa
     if not exe:
         return False
     os.makedirs(profile, exist_ok=True)
+    # CAP DISQUE: le profil dedie laisse grossir Cache/Code Cache sans limite (=> 700+ MB, a
+    # sature le disque). On borne le cache disque a 100 Mo et le media-cache a 50 Mo: largement
+    # assez pour Lens/AliExpress, et ca ne touche PAS les cookies/login (stockes ailleurs).
     args = [exe, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-            "--no-first-run", "--no-default-browser-check", "--new-window"]
+            "--no-first-run", "--no-default-browser-check", "--new-window",
+            "--disk-cache-size=104857600", "--media-cache-size=52428800"]
     if hidden:
         # pousse la fenetre tres loin hors de l'ecran + petite taille => l'utilisateur ne la
         # voit pas. On NE met PAS --headless (Google challenge le headless; un Chrome reel
