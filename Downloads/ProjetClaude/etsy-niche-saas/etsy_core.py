@@ -1647,7 +1647,16 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     # Gros gain vitesse: avant 1 page/tour avec attente ~4s bloquante. Plus haut = plus
     # vite mais + de risque 403 Datadome => 5 est un bon compromis.
     chunk = int(f.get("search_pages_chunk", 0)) or 5
-    PAGE_CAP = int(f.get("page_cap", 0) or 0) or max(250, target_count // 3 + 60)
+    # PLAFOND PAGES: Etsy CRASHE les pages trop hautes (page>~100 => "Page crashed"/ERR_ABORTED,
+    # zone morte sans resultat). Avant le cap a 250 laissait le curseur persistant grimper dans
+    # cette zone => chaque run repartait page 220 et ne ramenait QUE des crashes (=> "rien ne
+    # change"). On borne au stock REELLEMENT servi par Etsy (~80 pages utiles) et on reboucle.
+    PAGE_CAP = int(f.get("page_cap", 0) or 0) or min(max(target_count // 3 + 40, 60), 80)
+    # GARDE-FOU CURSEUR: si un ancien curseur empoisonne (run precedent) pointe deja dans la zone
+    # morte, on repart du debut au lieu de scanner du vide.
+    if pg >= PAGE_CAP:
+        pg = 0; _cursor_set(scrape_ckey, 0)
+    exhausted = False
     samples = {}   # name -> sample (pour le build)
     # SUR-ECHANTILLONNAGE (scrape = 0 credit => on peut en collecter large): l'IA et la
     # validation AliExpress filtrent APRES la boucle. On collecte plus de candidats pour
@@ -1677,7 +1686,9 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
             found = scraper.scrape_search_shops(keyword, pages=chunk, page_start=pg - chunk + 1)
         if not found:
             empty_streak += 1
-            if empty_streak >= empty_limit: break   # bloque => on rend ce qu'on a, direct
+            # pages vides/crashees = on a depasse le stock Etsy utile (ou block transitoire).
+            # => zone epuisee: on reboucle au debut au prochain run (pas de curseur dans le vide).
+            if empty_streak >= empty_limit: exhausted = True; break
             continue
         empty_streak = 0
         found_total += len(found)
@@ -1694,7 +1705,7 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         # Apres nonew_limit paquets ainsi, on s'arrete et on rend les resultats direct.
         if not batch:
             nonew_streak += 1
-            if nonew_streak >= nonew_limit: break
+            if nonew_streak >= nonew_limit: exhausted = True; break
             continue
         nonew_streak = 0
         # chargement PARALLELE du batch (1 navigateur, pool de pages)
@@ -1713,8 +1724,9 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         if scraped - scraped_at_last_keep >= stall_limit:
             break
     # memorise ou on s'est arrete pour REPRENDRE au prochain run (pages suivantes).
-    # Si on a depasse le stock Etsy (~PAGE_CAP), on reboucle au debut.
-    _cursor_set(scrape_ckey, 0 if pg >= PAGE_CAP else pg)
+    # Reboucle au debut si: stock Etsy depasse (pg>=cap) OU zone epuisee (pages vides/crashees,
+    # ou plus aucune nouvelle boutique). Evite de laisser le curseur coince dans la zone morte.
+    _cursor_set(scrape_ckey, 0 if (exhausted or pg >= PAGE_CAP) else pg)
     shops.sort(key=lambda x: -x["rate"])
     # raffinage IA: l'IA lit TOUS les titres de fiches produit de chaque boutique
     # (deja scrapes dans rec["titles"]) et DEDUIT le nom de niche depuis les titres
