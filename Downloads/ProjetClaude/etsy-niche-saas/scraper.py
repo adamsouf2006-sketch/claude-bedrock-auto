@@ -9,7 +9,7 @@ API publique (sync, utilisable depuis etsy_core):
   scrape_search_shops(keyword, pages, page_start) -> [(shop_name, sample_title)]
   scrape_shops_batch(names, wait)                 -> {name: {sold, months, titles}|{error}}
 """
-import re, time, sys, threading, asyncio
+import re, time, sys, threading, asyncio, os
 
 try:
     from scrapling.fetchers import AsyncStealthySession
@@ -17,10 +17,12 @@ try:
 except Exception:
     SCRAPLING_OK = False
 
-SESSION_PAGES = 10         # pages paralleles dans le navigateur (concurrence) — + haut =
-                           # + vite pour charger search-pages + boutiques en parallele
-SEARCH_WAIT = 3500         # attente JS page recherche (challenge anti-bot)
-SHOP_WAIT = 1600           # attente JS page boutique
+# VITESSE: concurrence + attentes reglables par env (gros volume => monter SCRAPE_PAGES, baisser
+# les waits). Defauts releves pour scraper 1000 boutiques en quelques minutes. ATTENTION: trop
+# haut SANS proxies => Etsy/Datadome bloque (403). Avec proxies valides on peut pousser fort.
+SESSION_PAGES = int(os.environ.get("SCRAPE_PAGES", "16"))   # pages paralleles (concurrence)
+SEARCH_WAIT = int(os.environ.get("SCRAPE_SEARCH_WAIT", "2600"))  # attente JS page recherche
+SHOP_WAIT = int(os.environ.get("SCRAPE_SHOP_WAIT", "1100"))      # attente JS page boutique
 
 # ---- anti-blocage Datadome: rotation de session + proxies optionnels --------------
 # Datadome bloque par IP + cookie de session. En recreant periodiquement le navigateur
