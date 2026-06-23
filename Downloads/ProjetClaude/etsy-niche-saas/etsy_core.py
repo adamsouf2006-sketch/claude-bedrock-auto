@@ -907,6 +907,28 @@ def ai_enrich_shops(shops, f):
 # Cle API Etsy: env ETSY_API_KEY ou config.local.json (jamais en dur / jamais commitee).
 API_KEY = _AICFG.get("etsy", "")
 BASE = "https://openapi.etsy.com/v3/application"
+
+# LIMITEUR DE DEBIT (regle Etsy: 5 requetes/seconde, header x-limit-per-second=5). Avant: 4
+# workers paralleles + plusieurs ThreadPools => on depassait 5/s => 429 EN RAFALE (d'ou les
+# hangs/erreurs). Token-bucket global thread-safe: on lisse a <=RATE req/s sur TOUS les threads
+# => plus de 429 de debit. Reglable via ETSY_RPS (defaut 5, marge a 4.5 pour la latence reseau).
+import collections as _collections
+try: _ETSY_RPS = float(os.environ.get("ETSY_RPS", "4.5"))
+except Exception: _ETSY_RPS = 4.5
+_rate_lock = threading.Lock()
+_rate_calls = _collections.deque()      # timestamps des derniers appels (fenetre 1s)
+def _rate_gate():
+    """Bloque jusqu'a ce qu'un creneau soit libre dans la fenetre 1s (max _ETSY_RPS appels)."""
+    while True:
+        with _rate_lock:
+            now = time.time()
+            while _rate_calls and now - _rate_calls[0] >= 1.0:
+                _rate_calls.popleft()
+            if len(_rate_calls) < _ETSY_RPS:
+                _rate_calls.append(now)
+                return
+            wait = 1.0 - (now - _rate_calls[0])
+        time.sleep(max(wait, 0.01))
 CACHE = Path(__file__).parent / "cache"; CACHE.mkdir(exist_ok=True)
 SHOP_CACHE = CACHE / "shops.json"
 CURSOR = CACHE / "cursor.json"   # rotation paging discovery (evite memes niches a chaque run)
@@ -1013,6 +1035,7 @@ def _get(path, _tries=3):
     req = urllib.request.Request(BASE + path, headers={"x-api-key": API_KEY})
     for attempt in range(_tries):
         try:
+            _rate_gate()                       # respecte la limite Etsy 5 req/s => zero 429 debit
             r = urllib.request.urlopen(req, timeout=12)
             raw = r.read(); headers = r.headers
             break
