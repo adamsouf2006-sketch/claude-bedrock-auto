@@ -749,6 +749,15 @@ _HIT_STRENGTHS = ("exact", "strong")
 def _is_hit(strength):
     return strength in _HIT_STRENGTHS
 
+# STOP (bouton ARRETER): la validation AliExpress est l'etape la plus LONGUE (~30-70s/boutique
+# via Lens+native). On stocke l'Event d'annulation au niveau module; chaque produit verifie ce
+# flag AVANT de demarrer une recherche (et avant le jitter native) => un STOP avorte les produits
+# pas encore demarres quasi instantanement, au lieu d'attendre la fin de toute la boutique.
+_STOP = None
+def _is_stopped():
+    s = _STOP
+    return bool(s is not None and s.is_set())
+
 # PRECISION GATE (anti faux positif). Un "strong" obtenu UNIQUEMENT sur la distance de hash
 # dans la zone tolerante (SAFE < dmin <= STRONG_MAX) est FRAGILE: c'est la zone ouverte pour
 # tolerer le changement de FOND des dropshippers, mais elle attrape aussi des produits DIFFERENTS
@@ -992,6 +1001,8 @@ async def _check_native(pg, prod):
     imgs = [u for u in (prod.get("image_urls") or [prod.get("image_url")]) if u][:2]
     if not (NATIVE_FALLBACK and imgs):
         return (False, "image", {"n": 0})
+    if _is_stopped():                     # STOP: pas de nouvelle recherche native
+        return (False, "stopped", {"n": 0})
     global _native_count, _native_last
     if _native_count >= NATIVE_MAX:       # cap atteint => on protege le compte, plus de native
         return (False, "image", {"n": 0, "native_capped": True})
@@ -1036,6 +1047,8 @@ async def _check_all(pg, prod):
     - captcha/no_image Lens => on n'enchaine PAS le native (inutile / page a problemes).
     - Lens trouve un signal texte mais pas de hit image => on tente le native; s'il rate,
       on renvoie le signal texte de Lens (recall preserve, etsy_core combine avec l'IA)."""
+    if _is_stopped():
+        return (False, "stopped", {})       # STOP: n'entame pas ce produit
     hit, via, detail = await _check_lens(pg, prod)
     if hit or via in ("captcha", "no_image", "erreur"):
         return hit, via, detail
@@ -1225,6 +1238,8 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
         todo = list(products)
         proxy_raw = _next_proxy_raw() if pool else None
         for rnd in range(max_rounds):
+            if _is_stopped():
+                break
             if engine == "scrapling":
                 res_round = await _round_scrapling(proxy_raw, todo)
             elif engine == "cdp":
@@ -1280,14 +1295,21 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
     res["text_coverage"] = round(res["text_hits"] / tested, 3) if tested else 0.0
     return res
 
-def validate_shop(products, min_match=3, hash_thresh=12, sim_thresh=0.30, headless=None, test_all=False):
+def validate_shop(products, min_match=3, hash_thresh=12, sim_thresh=0.30, headless=None, test_all=False, stop=None):
     """Sync: valide une boutique. products = [{title, image_url}]. Tente image/produit,
     fallback texte si l'upload image est bloque. Boutique validee si >= min_match trouves.
     headless=None => non-headless par defaut (patchright stealth passe mieux l'anti-bot
-    AliExpress/Datadome). Override via env ALI_HEADLESS=1."""
+    AliExpress/Datadome). Override via env ALI_HEADLESS=1.
+    stop = threading.Event optionnel (bouton ARRETER): si set, les produits pas encore demarres
+    sont avortes quasi instantanement (au lieu d'attendre la fin de toute la boutique)."""
     if not ENGINE_OK:
         return {"validated": False, "hits": 0, "total": len(products or []), "error": "moteur navigateur indisponible"}
     if headless is None:
         import os as _os
         headless = _os.environ.get("ALI_HEADLESS", "0") in ("1", "true", "yes")
-    return _run(_validate(products or [], min_match, hash_thresh, sim_thresh, headless, test_all))
+    global _STOP
+    _STOP = stop
+    try:
+        return _run(_validate(products or [], min_match, hash_thresh, sim_thresh, headless, test_all))
+    finally:
+        _STOP = None

@@ -2519,7 +2519,7 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         for _try in range(2):
             try:
                 r = ali_image.validate_shop(products, min_match=min_match, sim_thresh=sim_thresh,
-                                            test_all=True)
+                                            test_all=True, stop=stop)
                 break
             except Exception:
                 r = None
