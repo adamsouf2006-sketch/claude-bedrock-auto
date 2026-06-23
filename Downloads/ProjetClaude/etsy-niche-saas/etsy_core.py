@@ -687,22 +687,27 @@ def profile_drop_score(s):
     age = s.get("months")
     try: age = float(age) if age is not None else None
     except Exception: age = None
-    old = age is not None and age > 48
-    young = age is not None and age < 12
-    # COHERENCE = signal DOMINANT (le vrai discriminant artisan/revendeur).
+    # 1) COHERENCE (discriminant artisan/revendeur) applique d'abord sur le jugement titres.
     if coh is False:
-        # catalogue heteroclite (familles sans rapport) = revendeur quasi-certain. Plancher haut.
-        score = max(score, 0.80) + (0.10 if young else 0.0)
+        score = max(score, 0.80)            # catalogue heteroclite = revendeur
     elif coh is True:
-        # mono-niche focalisee = profil ARTISAN, MEME si la base produit est sourcable (un graveur
-        # sur bambou etabli n'est pas un dropshipper). On PLAFONNE fort le score: l'IA titres seule
-        # surnote les bases generiques ("bamboo set"). Un vrai drop a un catalogue incoherent.
-        cap = 0.30 if old else 0.55
-        score = min(score, cap)
+        score = min(score, 0.55)            # mono-niche focalisee = penche artisan
+    # 2) AGE = GATE DOMINANT (regle utilisateur: >1 an ne fait quasi JAMAIS de drop ; <1 an =
+    # suspect #1). L'age PRIME sur les titres: une vieille boutique ne peut pas etre flaggee drop
+    # sur le seul profil (il faudra une PREUVE image Lens, geree en aval). Une jeune boutique a un
+    # plancher de suspicion. Cette borne ne touche PAS dropship_confirmed via Lens (preuve directe).
+    if age is None:
+        pass                                 # age inconnu: on garde le profil tel quel
+    elif age < 6:
+        score = max(score, 0.70)             # tres jeune = forte presomption drop
+    elif age < 12:
+        score = max(score, 0.55)             # < 1 an = suspect, plancher
+    elif age <= 24:
+        score = min(score, 0.45)             # 1-2 ans = peu probable, plafonne
+    elif age <= 48:
+        score = min(score, 0.30)             # 2-4 ans = improbable
     else:
-        # coherence inconnue: on retombe sur age comme garde-fou faible.
-        if young: score += 0.10
-        elif old: score -= 0.15
+        score = min(score, 0.20)             # > 4 ans = quasi jamais drop
     return round(max(0.0, min(1.0, score)), 2)
 
 def ai_enrich_shops(shops, f):
@@ -2025,6 +2030,11 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # Seuil ai_dropship (rapide, sans navigateur). On continue de chercher (rounds) jusqu'a
     # atteindre la cible en boutiques dropship. ds_min reglable; 0 desactive le gate.
     ds_min = float(f.get("dropship_min", 0.5)) if ai_available() else 0.0
+    # GATE de COLLECTE volontairement TOLERANT (plus bas que le filtre final): on collecte les
+    # candidats PLAUSIBLES (jeunes + generiques + mid-age incoherents) pour les valider par Lens,
+    # PUIS le filtre final (age_gate + Lens) tranche. Trop strict ici couperait une vraie boutique
+    # drop de 12-24 mois (profil plafonne par l'age) AVANT meme la preuve image. Cf CODBoutiqueHouse.
+    collect_min = min(ds_min, 0.30) if ds_min > 0 else 0.0
 
     def absorb(sub):
         nonlocal api_used, listing_calls, ai_used, ali_used
@@ -2043,8 +2053,8 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
             # un artisan etabli coherent tombe sous le seuil meme si un titre parait generique.
             ad = s.get("ai_profile_drop")
             if ad is None: ad = s.get("ai_dropship")
-            if ds_min > 0 and (ad is None or ad < ds_min):
-                continue                    # GATE: garde seulement les boutiques dropship (IA)
+            if collect_min > 0 and (ad is None or ad < collect_min):
+                continue                    # GATE collecte tolerant; le tri final tranche
             seen[sid] = s; merged.append(s); added += 1
         return added
 
@@ -2429,6 +2439,19 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
             elif pdr >= 0.6:
                 score01 = max(score01, 0.5)
         score01 = min(1.0, score01)
+        # GATE AGE (regle utilisateur: boutique > 1 an ne fait quasi JAMAIS de drop). Une vieille
+        # boutique ne peut etre flaggee drop que sur PREUVE IMAGE FORTE (Lens couvre la majorite
+        # des produits, OU confirmation page produit, OU marge >=5x). Un match Lens PARTIEL (ex
+        # 40%) sur une boutique de 4 ans = produit d'artisan qui existe aussi sur Ali = FAUX
+        # positif => on bride. Cas ImperfectBySian (55 mois, 40% Lens) qui sortait a 80/100.
+        try: _age = float(s.get("months")) if s.get("months") is not None else None
+        except Exception: _age = None
+        strong_proof = (cov >= 0.70) or page_boost or bool(mr is not None and mr >= 5.0)
+        age_gate = False
+        if _age is not None and _age > 24 and not strong_proof:
+            score01 = min(score01, 0.35)
+            age_gate = True
+        s["age_drop_gate"] = age_gate
         s["dropship_score"] = round(score01, 2)
         s["dropship_score100"] = round(100 * score01)
         # VERDICT CONSENSUS: un seul signal (Lens) ne suffit pas a confirmer du dropship.
@@ -2443,8 +2466,14 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # PROFIL fortement dropship (jeune + catalogue incoherent + IA titres haute) = 2e signal
         # INDEPENDANT de Lens. Confirme quand Lens est aveugle (cas MoroaHouse: produits chinois
         # non indexes). Seuil HAUT (0.8) pour ne pas confirmer un artisan sur du bruit.
-        profile_boost = bool(pdr is not None and pdr >= 0.8)
-        if s.get("ali_validated") is None:
+        # GATE AGE prime: vieille boutique sans preuve image forte => profil/IA ne suffisent PAS
+        # a confirmer (l'age dit "tres improbable"). Seule une vraie preuve image (strong_proof)
+        # peut confirmer une boutique > 2 ans.
+        profile_boost = bool(pdr is not None and pdr >= 0.8) and not age_gate
+        if age_gate:
+            # > 2 ans + pas de preuve image forte: pas dropship (verdict NEGATIF clair).
+            s["dropship_confirmed"] = False
+        elif s.get("ali_validated") is None:
             s["dropship_confirmed"] = True if profile_boost else None
         elif s.get("ali_validated"):
             if ad is None:
