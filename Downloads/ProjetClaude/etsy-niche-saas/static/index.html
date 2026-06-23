@@ -147,6 +147,7 @@
         <option value="live">API Etsy (1 crédit/boutique, rapide)</option>
         <option value="scrape">Scraping (0 crédit, navigateur, lent)</option>
       </select>
+      <div class="chk" style="margin-top:6px"><input type="checkbox" id="use_vision"> 👁️ Analyse photos IA (payant ~$0.0024/recherche, +précis sur le drop)</div>
       <button id="simgo" onclick="similar()" style="margin-top:8px">🧬 Trouver boutiques similaires</button>
       <button id="simstop" class="sec" onclick="stopSearch()" style="display:none;margin-top:6px;background:#c0392b;color:#fff">⏹ Arrêter & garder les résultats</button>
     </details>
@@ -305,6 +306,7 @@ function simParams(){
   const p=params(); p.delete("source"); p.delete("keyword");
   p.set("shop", val("sim_shop"));
   p.set("mode", val("sim_mode"));
+  p.set("use_vision", chk("use_vision") ? "1" : "");   // analyse photos IA (payant), opt-in
   p.set("target_count", val("sim_target"));   // cible dediee clone finder
   p.set("min_rate", val("sim_min_rate"));      // ventes/mois min dedie
   return p;

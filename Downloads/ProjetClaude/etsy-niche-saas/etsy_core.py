@@ -40,7 +40,7 @@ DAY_LIMIT_DEFAULT = 5000  # quota Etsy/jour par defaut (reset 00:00 UTC)
 # Plusieurs cles supportees => failover automatique (les modeles :free sont rate-limited).
 def _load_ai_config():
     cfg = {"keys": [], "model": "", "anthropic": "", "etsy": "",
-           "glm_key": "", "glm_model": "", "glm_base": ""}
+           "glm_key": "", "glm_model": "", "glm_base": "", "vision_models": None}
     # 1) env
     env_or = os.environ.get("OPENROUTER_API_KEY", "")
     if env_or:
@@ -65,6 +65,7 @@ def _load_ai_config():
             cfg["glm_key"] = cfg["glm_key"] or d.get("glm_key", "")
             cfg["glm_model"] = cfg["glm_model"] or d.get("glm_model", "")
             cfg["glm_base"] = cfg["glm_base"] or d.get("glm_base", "")
+            cfg["vision_models"] = cfg["vision_models"] or d.get("vision_models")
         except Exception:
             pass
     return cfg
@@ -143,6 +144,75 @@ def _ai_call(prompt, max_tokens=2000):
             return ""
     return ""
 
+# ---- IA VISION (analyse photos produit) -----------------------------------------
+# Signal SOFT (jamais exclusif): les dropshippers utilisent souvent des photos trop nettes /
+# studio / generees IA / catalogue usine. Mais (1) certains dropshippers ont des photos
+# "amateur" et (2) certains artisans ont des photos pro => ce signal PONDERE, il ne decide pas
+# seul. Modeles vision GRATUITS OpenRouter.
+# Modeles vision TESTES OK sur OpenRouter (2026-06). Les :free vision sont inutilisables
+# (429 chronique ou ne suivent pas le format JSON). On prend des modeles cheap (~$0.0002/image)
+# qui suivent le JSON et repondent en ~1.5s. nemotron free en DERNIER recours (gratuit mais
+# obeit mal). Surchage possible via config.local.json "vision_models": [...].
+VISION_MODELS = _AICFG.get("vision_models") or [
+    "google/gemini-2.5-flash-lite",
+    "amazon/nova-lite-v1",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+]
+
+def vision_available():
+    return bool(OPENROUTER_KEYS or ANTHROPIC_KEY)
+
+def _ai_vision_call(prompt, image_urls, max_tokens=300):
+    """1 prompt + images -> texte. Best-effort: '' si pas de provider vision ou echec."""
+    imgs = [u for u in (image_urls or []) if u][:4]
+    if not imgs:
+        return ""
+    if OPENROUTER_KEYS:
+        content = [{"type": "text", "text": prompt}]
+        content += [{"type": "image_url", "image_url": {"url": u}} for u in imgs]
+        for model in VISION_MODELS:
+            for key in OPENROUTER_KEYS:
+                try:
+                    body = json.dumps({"model": model, "max_tokens": max_tokens, "temperature": 0,
+                                       "messages": [{"role": "user", "content": content}]}).encode()
+                    req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions",
+                        data=body, headers={"Authorization": "Bearer " + key,
+                        "content-type": "application/json", "HTTP-Referer": "https://localhost",
+                        "X-Title": "CraftPilot"})
+                    r = json.load(urllib.request.urlopen(req, timeout=60))
+                    return r["choices"][0]["message"]["content"]
+                except Exception:
+                    continue
+    return ""
+
+def ai_photo_drop_signal(image_urls):
+    """Analyse les photos produit -> proba 0..1 que ce soit du dropship d'apres l'ASPECT des
+    photos (studio/IA/catalogue usine vs photo artisan reelle). Signal SOFT. None si indisponible."""
+    if not vision_available():
+        return None
+    prompt = (
+        "Tu es expert en detection de dropshipping sur Etsy. Voici des photos produit d'UNE "
+        "boutique. Juge UNIQUEMENT l'ASPECT VISUEL des photos (pas le produit en soi).\n"
+        "Indices que ce sont des photos de REVENDEUR/dropship: rendu studio parfait, fond blanc/uni "
+        "catalogue, lumiere artificielle impeccable, image trop nette/lisse, aspect genere par IA, "
+        "produit detoure, packaging usine, photos clairement reprises d'un fournisseur.\n"
+        "Indices de vraie boutique ARTISAN: photo amateur, lumiere naturelle, decor reel/maison, "
+        "mains, atelier, imperfections, mise en scene personnelle, style coherent fait par le vendeur.\n"
+        "ATTENTION: signal NON exclusif. Un artisan peut avoir de belles photos pro; un dropshipper "
+        "peut avoir des photos moches. Donne juste ta probabilite d'apres l'aspect.\n"
+        "Reponds UNIQUEMENT en JSON: {\"drop\":0.0,\"why\":\"3-6 mots\"}"
+    )
+    txt = _ai_vision_call(prompt, image_urls)
+    if not txt:
+        return None
+    try:
+        txt = txt[txt.find("{"): txt.rfind("}") + 1]
+        d = json.loads(txt)
+        v = float(d.get("drop"))
+        return max(0.0, min(1.0, v))
+    except Exception:
+        return None
+
 # ---- Taxonomie de niches FIXE (large) -----------------------------------------
 # Probleme avant: l'IA inventait un nom hyper-specifique par boutique ("Couvercles
 # boites tissu", "Figurines laiton vintage") => 1 boutique par niche, impossible
@@ -175,7 +245,8 @@ def _ai_refine_chunk(chunk, query=""):
     en examinant ses titres UN PAR UN puis decide la niche majoritaire. Si `query`
     fournie, l'IA juge AUSSI la pertinence semantique vs la recherche (ex: 'support'
     = un support/socle, PAS 'emotional support')."""
-    items = [{"id": s["id"], "titres": (s.get("titles") or [s.get("sample", "")])[:60]}
+    items = [{"id": s["id"], "age_mois": s.get("months"), "ventes_total": s.get("sold"),
+              "titres": (s.get("titles") or [s.get("sample", "")])[:60]}
              for s in chunk]
     rel_rule = ""
     rel_field = ""
@@ -226,12 +297,43 @@ def _ai_refine_chunk(chunk, query=""):
         "artificiels => 'Fleurs & plantes artificielles' (PAS 3 niches separees). Idem "
         "interieur/exterieur = meme niche.\n"
         "   * nomme par le PRODUIT, jamais par un theme/occasion/style.\n"
-        "- dropship (float 0..1): proba que ces produits soient INDUSTRIELS revendus, "
-        "trouvables A L'IDENTIQUE sur AliExpress/Alibaba. 0.8-1 = generique mass-produit "
-        "(led, gadget, deco usine, print-on-demand). 0-0.2 = vrai artisanat unique fait main.\n"
+        "- dropship (float 0..1): proba que cette boutique REVENDE des produits industriels "
+        "sourcables sur AliExpress/Alibaba (= dropshipping), PAS de l'artisanat.\n"
+        "  RAISONNE comme un acheteur experimente, sois LUCIDE, ne te fie pas qu'au mot 'handmade':\n"
+        "  Indices FORTS de dropship (montent le score):\n"
+        "   * produit generique mass-produit: led, gadget electronique, deco usine, resine moulee, "
+        "acier inox, silicone, plastique, objets identiques declinables en 10 couleurs.\n"
+        "   * catalogue LARGE et heteroclite (beaucoup de produits sans rapport entre eux) = revente.\n"
+        "   * titres bourres de mots-cles SEO, dimensions exactes, 'free shipping', 'wholesale', "
+        "lots/bulk, variantes infinies => catalogue usine.\n"
+        "   * memes produits qu'on voit partout sur Amazon/Temu/AliExpress.\n"
+        "  ATTENTION (ne te fais pas avoir): un dropshipper PEUT mettre 'handmade/custom/personalized' "
+        "et changer les photos (fond, packaging) pour tromper Etsy. Le mot 'custom' NE prouve PAS "
+        "l'artisanat. Juge le PRODUIT REEL: un objet personnalisable mais industriel (mug imprime, "
+        "plaque gravee laser sur flan achete, bijou acier) reste dropship-able.\n"
+        "  Indices d'artisanat REEL (baissent le score): matiere brute travaillee a la main "
+        "(bois tourne, ceramique, couture, tricot/crochet, bougie coulee maison), piece unique, "
+        "petit catalogue coherent, imperfections, 'one of a kind'.\n"
+        "  SIGNAUX CONTEXTE (fournis: age_mois, ventes_total) — PESE-LES, ils sont DECISIFS:\n"
+        "   * COHERENCE catalogue = LE signal #1. Un ARTISAN a UNE niche coherente (tous les "
+        "titres tournent autour du meme savoir-faire). Un DROPSHIPPER a un catalogue HETEROCLITE: "
+        "des categories SANS RAPPORT entre elles (ex: luminaires LED + piquets de jardin metal + "
+        "lampes papier + porte-livre bois dans la MEME boutique = revendeur evident, dropship>=0.8). "
+        "Si tu vois 3+ familles de produits sans lien => dropship tres haut.\n"
+        "   * AGE: une boutique JEUNE (age_mois < 12) avec deja un catalogue large et des produits "
+        "generiques = dropship typique (monte le score). Une boutique ANCIENNE (age_mois > 48) avec "
+        "un catalogue COHERENT et personnalise = quasi toujours un vrai artisan (baisse le score, "
+        "meme si elle source une base: un graveur sur bambou depuis 7 ans n'est PAS un dropshipper).\n"
+        "   * Ne te fie pas au volume de ventes seul: un artisan etabli vend beaucoup AUSSI.\n"
+        "- coherent (bool) [OBLIGATOIRE, ne l'omets JAMAIS]: regarde l'ENSEMBLE des titres et "
+        "decide. true = TOUS les produits relevent d'UNE meme famille/savoir-faire (ex: que des "
+        "ustensiles bois graves, que des bougies) meme avec des variantes => boutique focalisee, "
+        "profil ARTISAN. false = le catalogue melange des FAMILLES SANS RAPPORT (ex: luminaires LED "
+        "+ piquets de jardin + lampes papier + porte-livres bois) => profil REVENDEUR/dropship. "
+        "C'est le signal le PLUS important: pese-le bien.\n"
         "- reason (str): 4-8 mots citant le produit dominant observe.\n"
         "Reponds UNIQUEMENT en JSON compact, rien d'autre: "
-        "{\"r\":[{\"id\":\"..\",\"accept\":true," + rel_field + "\"niche\":\"..\",\"dropship\":0.1,\"reason\":\"..\"}]}\n"
+        "{\"r\":[{\"id\":\"..\",\"accept\":true," + rel_field + "\"niche\":\"..\",\"dropship\":0.1,\"coherent\":true,\"reason\":\"..\"}]}\n"
         + json.dumps(items, ensure_ascii=False)
     )
     out = {}
@@ -528,6 +630,81 @@ def snap_niche(name):
             return n
     return best if score else "Autre deco maison"
 
+# On NE strippe PAS les mots matiere/produit (wood, led, metal...): ils PORTENT la coherence
+# d'un savoir-faire (un menuisier partage 'wood' partout). On retire seulement le bruit generique.
+_COH_STOP = set(("the for with and set of custom personalized handmade gift gifts new your "
+    "name kit pack piece pieces large small best selling free shipping color size cm inch "
+    "unique a an to in on by mm pcs pc inches personalised").split())
+
+def catalog_coherence(titles, sample=30):
+    """Cohérence DETERMINISTE du catalogue (ne depend PAS de l'IA, souvent peu fiable ici).
+    Mesure la similarite de tokens MOYENNE entre paires de titres. Un ARTISAN focalise vend
+    des variantes d'un meme produit => titres partagent beaucoup de mots (sim haute). Un
+    REVENDEUR melange des familles sans rapport (LED, jardin, lampe, cuisine) => titres
+    partagent peu (sim basse). Retourne (is_coherent, avg_sim) ; None si trop peu de titres."""
+    import re as _re
+    toks = []
+    for t in (titles or [])[:sample]:
+        ws = set(w for w in _re.findall(r"[a-z0-9]+", (t or "").lower())
+                 if len(w) > 2 and w not in _COH_STOP)
+        if ws:
+            toks.append(ws)
+    if len(toks) < 3:
+        return (None, None)
+    sims = []
+    for i in range(len(toks)):
+        for j in range(i + 1, len(toks)):
+            u = toks[i] & toks[j]; v = toks[i] | toks[j]
+            if v:
+                sims.append(len(u) / len(v))
+    if not sims:
+        return (None, None)
+    avg = sum(sims) / len(sims)
+    # Seuil BAS volontaire: un artisan, meme avec des produits varies, garde un vocabulaire
+    # commun (matiere/savoir-faire: 'wood' partout). Seul un catalogue VRAIMENT eclate (familles
+    # totalement etrangeres: LED + jardin + lampe + cuisine) tombe sous le seuil => revente.
+    # Tunable via env COH_THRESH.
+    try: thr = float(os.environ.get("COH_THRESH", "0.07"))
+    except Exception: thr = 0.07
+    return (avg >= thr, round(avg, 3))
+
+def profile_drop_score(s):
+    """Signal dropship base sur le PROFIL boutique (independant de Lens, qui rate les produits
+    chinois generiques): combine le jugement IA titres (ai_dropship), la COHERENCE du catalogue
+    (incoherent = revendeur) et l'AGE (boutique jeune + produits generiques = drop typique ;
+    boutique ancienne coherente = artisan). Retourne 0..1 ou None si pas de jugement IA.
+    Conçu pour rattraper le cas MoroaHouse: jeune, catalogue fourre-tout, Lens muet => l'outil
+    le notait bas a tort. Ici son ai_dropship eleve + incoherence + jeunesse => score haut."""
+    ad = s.get("ai_dropship")
+    if ad is None:
+        return None
+    score = float(ad)
+    # COHERENCE: priorite au calcul DETERMINISTE sur les titres (l'IA omet souvent le champ et
+    # surnote les bases generiques). On ne retombe sur le verdict IA que si pas assez de titres.
+    det_coh, coh_sim = catalog_coherence(s.get("titles") or [])
+    s["catalog_coherence"] = coh_sim
+    coh = det_coh if det_coh is not None else s.get("ai_coherent")
+    age = s.get("months")
+    try: age = float(age) if age is not None else None
+    except Exception: age = None
+    old = age is not None and age > 48
+    young = age is not None and age < 12
+    # COHERENCE = signal DOMINANT (le vrai discriminant artisan/revendeur).
+    if coh is False:
+        # catalogue heteroclite (familles sans rapport) = revendeur quasi-certain. Plancher haut.
+        score = max(score, 0.80) + (0.10 if young else 0.0)
+    elif coh is True:
+        # mono-niche focalisee = profil ARTISAN, MEME si la base produit est sourcable (un graveur
+        # sur bambou etabli n'est pas un dropshipper). On PLAFONNE fort le score: l'IA titres seule
+        # surnote les bases generiques ("bamboo set"). Un vrai drop a un catalogue incoherent.
+        cap = 0.30 if old else 0.55
+        score = min(score, cap)
+    else:
+        # coherence inconnue: on retombe sur age comme garde-fou faible.
+        if young: score += 0.10
+        elif old: score -= 0.15
+    return round(max(0.0, min(1.0, score)), 2)
+
 def ai_enrich_shops(shops, f):
     """Applique le verdict IA aux boutiques. Retourne (shops_filtres, ai_used).
     - accept=false => boutique retiree (vrai tri intelligent).
@@ -577,8 +754,11 @@ def ai_enrich_shops(shops, f):
         if "dropship" in v:
             try: s["ai_dropship"] = round(float(v["dropship"]), 2)
             except Exception: pass
+        if "coherent" in v:
+            s["ai_coherent"] = bool(v.get("coherent"))
         if v.get("reason"):
             s["ai_reason"] = str(v["reason"])
+        s["ai_profile_drop"] = profile_drop_score(s)
         if gate_ds and s.get("ai_dropship") is not None and s["ai_dropship"] < thr:
             continue                            # produit trop unique => pas dropship-able
         kept.append(s)
@@ -1416,7 +1596,7 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         ali_used = True
         nprod = int(f.get("ali_products", 10) or 10)
         minm = int(f.get("ali_min_match", 2) or 2)
-        validate_shops_ali(shops, nprod, minm, stop=stop)
+        validate_shops_ali(shops, nprod, minm, stop=stop, use_vision=bool(f.get("use_vision")))
         if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
             # CONSENSUS: on ne garde que les boutiques ou Lens A TROUVE les produits sur
             # AliExpress ET (si l'IA a juge) ou l'IA estime le produit revendable. Coupe les
@@ -1649,7 +1829,8 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         ali_used = True
         nprod = int(f.get("ali_products", 10) or 10)
         minm = int(f.get("ali_min_match", 3) or 3)
-        enriched_calls += validate_shops_ali(shops, nprod, minm, stop=stop)
+        enriched_calls += validate_shops_ali(shops, nprod, minm, stop=stop,
+                                             use_vision=bool(f.get("use_vision")))
         # gate seulement si AliExpress n'a PAS bloque (sinon on garderait 0 boutique).
         # CONSENSUS Lens+IA (dropship_confirmed) pour couper les faux positifs.
         if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
@@ -1858,7 +2039,10 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
                 continue                    # jamais la boutique source elle-meme
             if sid in seen:
                 continue
-            ad = s.get("ai_dropship")
+            # GATE sur le signal PROFIL (ai_dropship + coherence + age), pas le seul ai_dropship:
+            # un artisan etabli coherent tombe sous le seuil meme si un titre parait generique.
+            ad = s.get("ai_profile_drop")
+            if ad is None: ad = s.get("ai_dropship")
             if ds_min > 0 and (ad is None or ad < ds_min):
                 continue                    # GATE: garde seulement les boutiques dropship (IA)
             seen[sid] = s; merged.append(s); added += 1
@@ -1888,10 +2072,13 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
         dc = s.get("dropship_confirmed")
         if dc is True:  return 2
         if dc is False: return 0
-        # pas de validation image: on classe par le jugement IA dropship (ai_dropship).
-        ad = s.get("ai_dropship")
+        # pas de validation image: on classe par le signal PROFIL (ai_dropship + coherence + age).
+        ad = s.get("ai_profile_drop")
+        if ad is None: ad = s.get("ai_dropship")
         return 2 if (ad is not None and ad >= 0.5) else 1
-    merged.sort(key=lambda x: (-_drop_rank(x), -(x.get("ai_dropship") or 0), -x.get("rate", 0)))
+    merged.sort(key=lambda x: (-_drop_rank(x),
+                               -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
+                               -x.get("rate", 0)))
     res = {
         "source": {
             "id": src_id, "name": src.get("name"), "url": src.get("url"),
@@ -1924,10 +2111,35 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
         try:
             nprod = int(f.get("ali_products", 4) or 4)
             minm = int(f.get("ali_min_match", 1) or 1)
-            validate_shops_ali(shown[:cap], nprod, minm, stop=stop)
+            validate_shops_ali(shown[:cap], nprod, minm, stop=stop,
+                                use_vision=bool(f.get("use_vision")))
             out["ali_used"] = True
         except Exception:
             pass
+    # FILTRE DUR + SEUIL SOUPLE: l'utilisateur veut SEULEMENT des boutiques qui font du drop.
+    # On JETTE les artisans clairs, on GARDE drop confirme + drop probable. Une boutique passe si:
+    #   - dropship_confirmed is True (consensus Lens/texte+IA)  -> garde
+    #   - dropship_confirmed is False (preuve artisan)          -> JETTE
+    #   - non validee (None): on retombe sur les signaux IA/score: garde si l'IA titres
+    #     OU la vision OU le score dropship indiquent du drop (seuil souple drop_keep_min, def 0.45).
+    # Garde-fou anti-0-resultat: si TOUT est jete (ex: validation bloquee, niche limite), on
+    # retombe sur le tri annote (montre tout) plutot que de renvoyer une liste vide.
+    keep_min = float(f.get("drop_keep_min", 0.45))
+    def _is_drop(s):
+        dc = s.get("dropship_confirmed")
+        if dc is True:  return True
+        if dc is False: return False
+        ad = s.get("ai_profile_drop"); pd = s.get("ai_photo_drop"); sc = s.get("dropship_score")
+        sig = [x for x in (ad, pd, sc) if x is not None]
+        return bool(sig) and max(sig) >= keep_min
+    only_drop = [s for s in shown if _is_drop(s)]
+    if only_drop:                              # au moins 1 vrai drop => filtre dur applique
+        out["shops"] = only_drop
+        out["matched"] = len(only_drop)
+        out["filtered_non_drop"] = len(shown) - len(only_drop)
+    else:                                      # rien de confirme: ne pas renvoyer vide
+        out["filtered_non_drop"] = 0
+        out["drop_filter_fallback"] = True
     return out
 
 # ---------------- validation dropship AliExpress ----------------
@@ -1997,7 +2209,8 @@ def _smart_sample_idx(pool, k, seed=0):
     sel += rest[:max(0, k - len(sel))]
     return sorted(set(sel))[:k]
 
-def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=True, stop=None):
+def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=True, stop=None,
+                       use_vision=False):
     """Verifie si les produits d'une boutique existent A L'IDENTIQUE sur AliExpress.
 
     use_image=True (defaut): recupere les VRAIES images produit de la boutique (Etsy API,
@@ -2102,6 +2315,18 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # trouves sur AliExpress par TEXTE quand l'image ne matche pas. Combine avec l'IA.
         s["ali_text_hits"] = r.get("text_hits", 0)
         s["ali_text_coverage"] = r.get("text_coverage", 0.0)
+        # SIGNAL VISION (soft, jamais exclusif): aspect des photos produit. Photos trop
+        # nettes/studio/IA => indice dropship; photos artisan reelles => indice artisanat.
+        # OFF par defaut (use_vision=False): seul signal PAYANT (les modeles vision gratuits
+        # OpenRouter sont inutilisables: 429 ou ne discriminent pas). La detection marche sans
+        # lui via la coherence catalogue (gratuite). N'activer que si budget OK (~$0.0024/recherche).
+        if use_vision:
+            try:
+                s["ai_photo_drop"] = ai_photo_drop_signal(s.get("images") or [])
+            except Exception:
+                s["ai_photo_drop"] = None
+        else:
+            s["ai_photo_drop"] = None
         # FORCE DES MATCHES (point 4): chaque produit trouve est grade exact/strong/weak avec
         # des points (70/40/15). On compte chaque categorie + le score MOYEN par produit trouve.
         # Verdict simple par boutique sur la moyenne: >=70 dropship probable, 40-70 douteux,
@@ -2178,12 +2403,32 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         text_consensus = bool(tcov >= 0.5 and ad is not None and ad >= 0.5)
         s["dropship_suspect"] = text_consensus     # photo custom: texte + IA concordent
         text_sig = tcov if (ad is not None and ad >= 0.5) else 0.0
+        # SIGNAL VISION (soft): aspect photos studio/IA. Pondere FAIBLE (0.10) et seulement
+        # comme APPOINT: il ne cree pas un dropship a lui seul (un artisan peut avoir de belles
+        # photos), il renforce/nuance un score deja base sur des preuves (Lens/texte/IA titres).
+        pd = s.get("ai_photo_drop")
+        photo_sig = float(pd) if pd is not None else None
         if ad is None:
             score01 = (0.60 / 0.75) * cov + (0.15 / 0.75) * margin_norm
         else:
-            score01 = 0.55 * cov + 0.20 * ad + 0.10 * margin_norm + 0.15 * text_sig
+            score01 = 0.50 * cov + 0.20 * ad + 0.10 * margin_norm + 0.10 * text_sig \
+                      + (0.10 * photo_sig if photo_sig is not None else 0.0)
+            if photo_sig is None:                   # pas de vision => renormalise sur les 4 autres
+                score01 = score01 / 0.90
         if text_consensus and cov < 0.01:
             score01 = max(score01, 0.55)            # dropship "photo custom" confirme texte+IA
+        # SIGNAL PROFIL (ai_dropship + incoherence catalogue + jeunesse): Lens est AVEUGLE aux
+        # produits chinois generiques (pas indexes / fond change) => coverage basse ecrasait le
+        # score d'un VRAI dropshipper jeune au catalogue fourre-tout (cas MoroaHouse). Quand le
+        # profil est tres parlant, il impose un plancher de score independamment de Lens.
+        pdr = s.get("ai_profile_drop")
+        if pdr is not None:
+            s["profile_drop"] = pdr
+            if pdr >= 0.75:
+                score01 = max(score01, pdr)         # profil tres dropship => plancher = profil
+            elif pdr >= 0.6:
+                score01 = max(score01, 0.5)
+        score01 = min(1.0, score01)
         s["dropship_score"] = round(score01, 2)
         s["dropship_score100"] = round(100 * score01)
         # VERDICT CONSENSUS: un seul signal (Lens) ne suffit pas a confirmer du dropship.
@@ -2195,14 +2440,18 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # La confirmation page produit est un 2e signal independant fort (vraie image source
         # AliExpress identique a la photo Etsy) => suffit a confirmer comme la marge.
         page_boost = bool(s.get("ali_page_confirmed", 0) >= 1)
+        # PROFIL fortement dropship (jeune + catalogue incoherent + IA titres haute) = 2e signal
+        # INDEPENDANT de Lens. Confirme quand Lens est aveugle (cas MoroaHouse: produits chinois
+        # non indexes). Seuil HAUT (0.8) pour ne pas confirmer un artisan sur du bruit.
+        profile_boost = bool(pdr is not None and pdr >= 0.8)
         if s.get("ali_validated") is None:
-            s["dropship_confirmed"] = None
+            s["dropship_confirmed"] = True if profile_boost else None
         elif s.get("ali_validated"):
             if ad is None:
-                s["dropship_confirmed"] = True if (margin_boost or page_boost) else None
+                s["dropship_confirmed"] = True if (margin_boost or page_boost or profile_boost) else None
             else:
-                s["dropship_confirmed"] = (ad >= 0.4) or margin_boost or page_boost
+                s["dropship_confirmed"] = (ad >= 0.4) or margin_boost or page_boost or profile_boost
         else:
-            # pas valide par IMAGE: confirme quand meme si consensus TEXTE + IA (photo custom).
-            s["dropship_confirmed"] = True if text_consensus else False
+            # pas valide par IMAGE: confirme si consensus TEXTE+IA (photo custom) OU profil fort.
+            s["dropship_confirmed"] = True if (text_consensus or profile_boost) else False
     return api

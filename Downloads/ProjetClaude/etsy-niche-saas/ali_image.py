@@ -707,8 +707,13 @@ _HASH_STRONG = 14
 # de la meme categorie (ex: deux bols en bois d'olivier, l'artisan et l'usine) => faux positif.
 # Diag: le MEME produit avec une photo differente donne d<=18 => 22 laisse une marge de securite.
 # Tunable via env ALI_HASH_STRONG_MAX (baisser pour + de precision, monter pour + de recall).
-try: _HASH_STRONG_MAX = int(_os.environ.get("ALI_HASH_STRONG_MAX", "22"))
-except Exception: _HASH_STRONG_MAX = 22
+# Defaut RELEVE a 26: les dropshippers changent le FOND des photos (studio blanc -> deco maison)
+# pour tromper Etsy. Le fond gonfle la distance aHash (luminance moyenne) meme quand le PRODUIT
+# est identique => 22 ratait ces boutiques (faux negatifs). 26 tolere le changement de fond tout
+# en rejetant les produits vraiment differents d'une meme categorie (d>30). dHash (structure du
+# produit) reste le garde-fou via _hash_dist=MAX(aHash,dHash). Baisser si trop de faux positifs.
+try: _HASH_STRONG_MAX = int(_os.environ.get("ALI_HASH_STRONG_MAX", "26"))
+except Exception: _HASH_STRONG_MAX = 26
 _POINTS = {"exact": 70, "strong": 40, "weak": 15, "none": 0}
 # Un produit ne compte comme "trouve sur AliExpress" (hit dropship) QUE si l'image est
 # confirmee (exact|strong). weak = moteur a remonte un lien mais image pas identique => PAS dropship.
