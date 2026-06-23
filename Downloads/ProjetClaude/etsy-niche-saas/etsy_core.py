@@ -1716,9 +1716,12 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
             if nonew_streak >= nonew_limit: exhausted = True; break
             continue
         nonew_streak = 0
+        if _stopped(stop):                 # STOP juste avant le chargement lourd du batch
+            break
         # chargement PARALLELE du batch (1 navigateur, pool de pages)
         results = scraper.scrape_shops_batch(batch)
         for name in batch:
+            if _stopped(stop): break       # STOP en plein traitement du batch
             scraped += 1
             rec = build(name, samples.get(name, ""), results.get(name, {}))
             if rec is None: continue
@@ -1745,11 +1748,13 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     if keyword.strip():
         f.setdefault("_query_raw", keyword.strip())   # phrase brute => match semantique fidele
     ai_used = False
-    if f.get("use_ai", True) and ai_available() and shops:
+    # STOP: si l'utilisateur a coupe, on SAUTE le raffinage IA (gros batch OpenRouter ~30s+) et
+    # la validation => on rend DIRECT les boutiques deja scrapees au lieu de "continuer".
+    if f.get("use_ai", True) and ai_available() and shops and not _stopped(stop):
         shops, ai_used = ai_enrich_shops(shops, f)
     # validation dropship AliExpress (opt-in), comme en mode discovery
     ali_used = False
-    if f.get("validate_ali") and shops:
+    if f.get("validate_ali") and shops and not _stopped(stop):
         ali_used = True
         nprod = int(f.get("ali_products", 10) or 10)
         minm = int(f.get("ali_min_match", 2) or 2)
@@ -1979,10 +1984,13 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     candidates = processed
     shops.sort(key=lambda x: -x["rate"])
     # 3) raffinage IA (GLM gratuit): juge + nomme la niche + verdict dropship
-    shops, ai_used = ai_enrich_shops(shops, f)
+    # STOP: on saute IA + validation si coupe => rend direct les boutiques deja trouvees.
+    ai_used = False
+    if not _stopped(stop):
+        shops, ai_used = ai_enrich_shops(shops, f)
     # 4) validation dropship AliExpress (opt-in): image/produit + fallback texte
     ali_used = False
-    if f.get("validate_ali") and shops:
+    if f.get("validate_ali") and shops and not _stopped(stop):
         ali_used = True
         nprod = int(f.get("ali_products", 10) or 10)
         minm = int(f.get("ali_min_match", 3) or 3)
