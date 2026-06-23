@@ -1839,6 +1839,11 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     f["no_match_budget"] = 10 ** 9          # desactive l'arret anticipe "plus de resultat"
     per_budget = max(200, max_api // max(len(kws), 1))
     max_rounds = int(f.get("similar_max_rounds", 0)) or (12 if not scrape_mode else 4)
+    # GATE DROPSHIP: on ne garde QUE les boutiques que l'IA juge dropship-ables (produits
+    # industriels revendables). L'utilisateur veut SEULEMENT du dropship, pas les artisans.
+    # Seuil ai_dropship (rapide, sans navigateur). On continue de chercher (rounds) jusqu'a
+    # atteindre la cible en boutiques dropship. ds_min reglable; 0 desactive le gate.
+    ds_min = float(f.get("dropship_min", 0.5)) if ai_available() else 0.0
 
     def absorb(sub):
         nonlocal api_used, listing_calls, ai_used, ali_used
@@ -1853,6 +1858,9 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
                 continue                    # jamais la boutique source elle-meme
             if sid in seen:
                 continue
+            ad = s.get("ai_dropship")
+            if ds_min > 0 and (ad is None or ad < ds_min):
+                continue                    # GATE: garde seulement les boutiques dropship (IA)
             seen[sid] = s; merged.append(s); added += 1
         return added
 
