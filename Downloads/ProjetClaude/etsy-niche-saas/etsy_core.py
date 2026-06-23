@@ -1884,23 +1884,6 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
         ad = s.get("ai_dropship")
         return 2 if (ad is not None and ad >= 0.5) else 1
     merged.sort(key=lambda x: (-_drop_rank(x), -(x.get("ai_dropship") or 0), -x.get("rate", 0)))
-    # VALIDATION DROPSHIP CIBLEE: on valide par image/texte SEULEMENT les boutiques finales
-    # montrees (les + probables d'abord), pas tout l'echantillon => verif faite ET rapide.
-    # ali_gate reste False: on n'enleve personne, on ANNOTE (dropship_confirmed / score).
-    if f.get("validate_ali_final", True) and merged and not _stopped(stop):
-        # plafond pour borner le temps (1 Chrome): on valide au + les N premieres (les + probables
-        # dropship par l'IA); au-dela, label IA seul. Override via filtre 'ali_validate_max'.
-        cap = int(f.get("ali_validate_max", 8) or 8)
-        topn = merged[:min(max(target_count, 1), cap)]
-        try:
-            nprod = int(f.get("ali_products", 4) or 4)
-            minm = int(f.get("ali_min_match", 1) or 1)
-            validate_shops_ali(topn, nprod, minm, stop=stop)
-            ali_used = True
-        except Exception:
-            pass
-        # re-trie apres validation (dropship confirme remonte)
-        merged.sort(key=lambda x: (-_drop_rank(x), -(x.get("ai_dropship") or 0), -x.get("rate", 0)))
     res = {
         "source": {
             "id": src_id, "name": src.get("name"), "url": src.get("url"),
@@ -1922,7 +1905,22 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
         "clusters": [],
         "shops": merged,
     }
-    return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
+    out = finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
+    # VALIDATION DROPSHIP CIBLEE: on valide par image/texte SEULEMENT les boutiques REELLEMENT
+    # AFFICHEES (finalize re-selectionne/re-trie => il faut valider APRES, sinon on validait
+    # d'autres boutiques que celles montrees => colonnes dropship vides). Plafond pour borner le
+    # temps (1 Chrome). On annote chaque boutique montree (pas de filtre dur).
+    shown = out.get("shops") or []
+    if f.get("validate_ali_final", True) and shown and not _stopped(stop):
+        cap = int(f.get("ali_validate_max", 8) or 8)
+        try:
+            nprod = int(f.get("ali_products", 4) or 4)
+            minm = int(f.get("ali_min_match", 1) or 1)
+            validate_shops_ali(shown[:cap], nprod, minm, stop=stop)
+            out["ali_used"] = True
+        except Exception:
+            pass
+    return out
 
 # ---------------- validation dropship AliExpress ----------------
 def _ali_kw(title):
@@ -2066,8 +2064,21 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
             s["ali_hits"] = 0; s["ali_via"] = {}; s["ali_blocked"] = False
             s["ali_matches"] = []; s["ali_validated"] = None
             continue
-        r = ali_image.validate_shop(products, min_match=min_match, sim_thresh=sim_thresh,
-                                    test_all=True)
+        # RESILIENCE: le Chrome CDP peut lacher un instant sous charge. Une erreur sur UNE
+        # boutique ne doit PAS avorter les suivantes => on RETENTE une fois, puis on marque la
+        # boutique inconnue et on continue (toutes les boutiques montrees ont un verdict).
+        r = None
+        for _try in range(2):
+            try:
+                r = ali_image.validate_shop(products, min_match=min_match, sim_thresh=sim_thresh,
+                                            test_all=True)
+                break
+            except Exception:
+                r = None
+        if r is None:
+            s["ali_hits"] = 0; s["ali_via"] = {}; s["ali_blocked"] = True
+            s["ali_matches"] = []; s["ali_validated"] = None
+            continue
         s["ali_hits"] = r.get("hits", 0)
         s["ali_via"] = r.get("via", {})
         s["ali_blocked"] = bool(r.get("blocked"))
