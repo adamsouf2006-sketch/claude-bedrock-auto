@@ -154,6 +154,12 @@ async def _get_session():
     global _session, _proxy_idx
     if _session is None:
         kw = dict(headless=False, network_idle=True, max_pages=SESSION_PAGES)
+        # MODE LEGER (SCRAPE_LIGHT=1): bloque images/fonts/media/CSS => ~8x MOINS de donnees
+        # (economise le quota proxy: 2Go -> ~6000 boutiques au lieu de ~1000) ET + rapide. Garde
+        # le HTML + JS (necessaires au parsing Etsy). A activer quand on paye la bande passante
+        # proxy. Defaut OFF (certaines pages Etsy rendent moins bien sans CSS => a tester).
+        if os.environ.get("SCRAPE_LIGHT", "0") in ("1", "true", "yes"):
+            kw["disable_resources"] = True
         if _PROXIES:                       # rotation d'IP a chaque (re)creation de session
             kw["proxy"] = _PROXIES[_proxy_idx % len(_PROXIES)]
             _proxy_idx += 1
