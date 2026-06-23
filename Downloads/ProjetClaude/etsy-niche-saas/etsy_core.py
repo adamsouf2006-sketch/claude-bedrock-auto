@@ -2228,8 +2228,12 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # VITESSE: en scrape chaque candidat = 1 catalogue complet scrape (browser, lent). On limite
     # le sur-echantillonnage (avant target*8 => 24 boutiques scrapees pour target=3 => timeout).
     # target*4 plafonne le pool tout en gardant de la marge pour le drop rare. Reglable.
-    pool_mult = int(f.get("pool_mult", 0)) or 5
-    pool_target = min(max(target_count * pool_mult, target_count + 12), target_count + 80)
+    # POOL ELARGI: l'utilisateur veut PLUS de boutiques affichees. On collecte beaucoup plus de
+    # candidats (mult 8, plafond +200) => plus de boutiques passent les gates et s'affichent.
+    # Reglable via pool_mult / pool_cap. NB: + de candidats = run + long (scrape browser).
+    pool_mult = int(f.get("pool_mult", 0)) or 8
+    pool_cap = int(f.get("pool_cap", 0)) or 200
+    pool_target = min(max(target_count * pool_mult, target_count + 12), target_count + pool_cap)
     confirmed_box = {"n": []}                # compteur partage pour la progression live
     rnd = 0
     while len(merged) < pool_target and rnd < max_rounds and not _stopped(stop):
@@ -2261,7 +2265,10 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # ~0% de recouvrement => rejetee. niche_ratio_min = part minimale du catalogue en-niche.
     # niche_min = plancher absolu anti-fluke (eviter de valider sur 1 titre tangent).
     niche_min = int(f.get("niche_min_products", 3))
-    niche_ratio_min = float(f.get("niche_ratio_min", 0.5))
+    # GATE NICHE DESSERRE (0.5 -> 0.35): l'utilisateur veut PLUS de boutiques. A 50% on rejetait
+    # les boutiques au catalogue MIXTE (justement les dropshippers fourre-tout). A 35% on garde
+    # celles dont 1/3 du catalogue recoupe la niche source => + de resultats. Reglable.
+    niche_ratio_min = float(f.get("niche_ratio_min", 0.35))
     photo_avg_min = float(f.get("photo_avg_min", 0.5))
     strict_min = float(f.get("drop_strict_min", 0.6))
     # VITESSE: 1 appel vision / 6 photos. 24 photos = 4 appels/boutique. 12 photos (2 appels)
