@@ -1680,7 +1680,9 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         import scraper as _scr; _has_proxies = bool(getattr(_scr, "_PROXIES", []))
     except Exception:
         _has_proxies = False
-    stall_limit = int(f.get("scrape_stall", 0)) or (300 if _has_proxies else 120)
+    # STALL scale sur la CIBLE: pour un gros volume (ex 1000 boutiques) il faut tolerer beaucoup
+    # de scan sans keep avant d'abandonner, sinon on s'arrete a ~120 et on n'atteint jamais 1000.
+    stall_limit = int(f.get("scrape_stall", 0)) or max(300 if _has_proxies else 120, target_count)
     scraped_at_last_keep = 0
     # boucle jusqu'a collect_target, epuisement Etsy, ou budget atteint.
     while len(shops) < collect_target and pg < PAGE_CAP and scraped < max_scraped and not _stopped(stop):
@@ -2199,6 +2201,12 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # PUIS le filtre final (age_gate + Lens) tranche. Trop strict ici couperait une vraie boutique
     # drop de 12-24 mois (profil plafonne par l'age) AVANT meme la preuve image. Cf CODBoutiqueHouse.
     collect_min = min(ds_min, 0.30) if ds_min > 0 else 0.0
+    # VOLUME: si on affiche TOUTES les similaires (show_non_drop), le gate de collecte profil
+    # rejetterait les artisans AVANT de remplir le pool => impossible d'atteindre 1000 boutiques.
+    # On le DESACTIVE dans ce mode: on collecte toutes les boutiques de la niche, le tri met les
+    # dropship en tete. (show_non_drop=0 => ancien gate dropship conserve.)
+    if f.get("show_non_drop", 1):
+        collect_min = 0.0
 
     def absorb(sub):
         nonlocal api_used, listing_calls, ai_used, ali_used
