@@ -2348,11 +2348,18 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
         # score d'affichage unifie: moyenne photos si dispo, sinon profil (pays/age/coherence)
         disp = photo_avg if photo_avg is not None else (s.get("ai_profile_drop") or 0)
         s["dropship_score"] = round(disp, 2); s["dropship_score100"] = round(100 * disp)
-        if drop:
-            s["relevance"] = round(nc / max(s["catalog_n"], 1), 2)
+        # AFFICHAGE: on montre TOUTES les boutiques SIMILAIRES (meme niche), pas seulement les
+        # dropship-confirmees (sinon sur une niche artisanale on rend 0). Les dropship sont triees
+        # EN TETE (cf tri plus bas) et chaque ligne porte son label drop. L'utilisateur voit donc
+        # un maximum de boutiques + le statut dropship de chacune. show_non_drop=0 => ancien
+        # comportement (dropship uniquement).
+        s["relevance"] = round(nc / max(s["catalog_n"], 1), 2)
+        show_non_drop = f.get("show_non_drop", 1)
+        if drop or show_non_drop:
             confirmed.append(s)
-            confirmed_box["n"] = confirmed
-            if progress: progress(len(confirmed), target_count)
+            if drop:
+                confirmed_box["n"] = [x for x in confirmed if x.get("dropship_confirmed")]
+            if progress: progress(len(confirmed_box["n"]), target_count)
     # TRI final: moyenne photos drop (ou profil) desc, puis ventes/mois.
     confirmed.sort(key=lambda x: (-(x.get("photo_drop_avg") if x.get("photo_drop_avg") is not None
                                     else (x.get("ai_profile_drop") or 0)), -x.get("rate", 0)))
