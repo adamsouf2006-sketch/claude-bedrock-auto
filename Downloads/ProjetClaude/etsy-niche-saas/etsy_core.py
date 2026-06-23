@@ -1006,10 +1006,14 @@ def _get(path, _tries=4):
             break
         except urllib.error.HTTPError as e:       # 401/429/5xx => corps souvent non-JSON
             _update_quota(e.headers.get("x-remaining-today"), e.headers.get("x-limit-per-day"))
-            if e.code in (429, 500, 502, 503, 504) and attempt < _tries - 1:
+            # 403 = throttle edge/Datadome TRANSITOIRE sur rafales paralleles (cle valide). Avant
+            # il n'etait PAS retente => un seul 403 burst tuait tout le run ("Erreur: http 403").
+            # On le retente avec backoff (un peu plus long): la cle marche, c'est juste une rafale.
+            if e.code in (403, 429, 500, 502, 503, 504) and attempt < _tries - 1:
                 try: wait = float(e.headers.get("Retry-After") or 0)
                 except Exception: wait = 0
-                time.sleep(wait or (0.6 * (2 ** attempt)))   # backoff: 0.6,1.2,2.4s
+                base = 1.2 if e.code == 403 else 0.6        # 403 throttle: backoff + long
+                time.sleep(wait or (base * (2 ** attempt)))  # backoff exponentiel
                 continue
             raw = e.read()
             try: msg = json.loads(raw.decode("utf-8", "replace")).get("error", "")
