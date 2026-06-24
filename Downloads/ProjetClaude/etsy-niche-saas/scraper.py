@@ -425,9 +425,11 @@ def _parse_shop(p):
 # Datadome ca ressemble a TOI qui navigues, pas a un bot d'automation => beaucoup moins de
 # blocage, pas besoin de proxy. Comme l'extension "Ultimate Web Scraper". Pagination = on ouvre
 # ?page=N en parallele (onglets), borne par SCRAPE_CDP_CONC.
-# DEFAUT ON: scraper via TON vrai Chrome (CDP) => Datadome passe SANS login ni proxy (teste:
-# 141 boutiques/3 pages). Mettre SCRAPE_VIA_CHROME=0 pour repasser sur l'ancien moteur camoufox.
-SCRAPE_VIA_CHROME = os.environ.get("SCRAPE_VIA_CHROME", "1") in ("1", "true", "yes")
+# CDP (scraping via ton vrai Chrome) = OPT-IN: passe Datadome sans proxy/login en isolation
+# (teste: 1126 boutiques, 0x429), MAIS instable dans le pipeline complet run_scrape (le scrape de
+# catalogues enchaine peut se figer). Defaut OFF => moteur camoufox eprouve. Active avec
+# SCRAPE_VIA_CHROME=1 pour la recherche SEARCH rapide; a affiner avant de le mettre par defaut.
+SCRAPE_VIA_CHROME = os.environ.get("SCRAPE_VIA_CHROME", "0") in ("1", "true", "yes")
 CDP_CONC = int(os.environ.get("SCRAPE_CDP_CONC", "4"))   # onglets paralleles (bas => moins de 429)
 CDP_GAP = float(os.environ.get("SCRAPE_CDP_GAP", "0.35")) # pause mini entre ouvertures d'onglet
 CDP_RETRIES = int(os.environ.get("SCRAPE_CDP_RETRIES", "3"))
@@ -617,6 +619,17 @@ def etsy_session_ok():
     except Exception:
         return False
 
+def _cdp_available():
+    """Vrai Chrome debug joignable ? (lance si besoin). False => on retombe sur scrapling pour
+    ne JAMAIS rester bloque a 0 si le CDP ne demarre pas dans le contexte serveur."""
+    try:
+        import ali_chrome
+        if ali_chrome.debug_ok():
+            return True
+        return bool(ali_chrome.ensure_chrome())
+    except Exception:
+        return False
+
 def _search_shops_cdp(keyword, pages, page_start):
     kw = keyword.strip().replace(" ", "+") or "handmade"
     urls = [f"https://www.etsy.com/search?q={kw}&page={pg}&ref=search"
@@ -637,8 +650,12 @@ def _shops_batch_cdp(names):
 # ---- API sync ----------------------------------------------------------------
 def scrape_search_shops(keyword, pages=1, page_start=1):
     """Pages de recherche -> [(shop_name, sample_title)]. 0 API."""
-    if SCRAPE_VIA_CHROME:
-        return _search_shops_cdp(keyword, pages, page_start)
+    if SCRAPE_VIA_CHROME and _cdp_available():
+        r = _search_shops_cdp(keyword, pages, page_start)
+        if r or not SCRAPLING_OK:
+            return r
+        # CDP n'a rien rendu (Chrome KO en contexte serveur) => on retombe sur scrapling au lieu
+        # de boucler sur des pages vides => jamais bloque a 0.
     out, seen = [], set()
     async def go():
         kw = keyword.strip().replace(" ", "+") or "handmade"
@@ -675,8 +692,11 @@ def scrape_shops_batch(names, wait=SHOP_WAIT):
     (404, boutique absente) ne sont PAS re-essayees (pas un crash)."""
     if not names:
         return {}
-    if SCRAPE_VIA_CHROME:
-        return _shops_batch_cdp(names)
+    if SCRAPE_VIA_CHROME and _cdp_available():
+        r = _shops_batch_cdp(names)
+        if not SCRAPLING_OK or any((v or {}).get("sold") is not None for v in r.values()):
+            return r
+        # CDP n'a rien rendu => fallback scrapling (jamais bloque)
     if not SCRAPLING_OK:
         return {}
     async def fetch_set(targets):

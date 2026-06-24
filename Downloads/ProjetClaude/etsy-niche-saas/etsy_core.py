@@ -1739,9 +1739,9 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
 
     empty_streak = 0; nonew_streak = 0
     # budget anti-boucle: au pire on charge ~30 boutiques par cible avant d'abandonner.
-    # RELEVE (l'utilisateur veut CHERCHER PLUS LONGTEMPS): plancher 800 (avant 400) => creuse
-    # bien plus de boutiques avant d'arreter. Reglable via max_scraped.
-    max_scraped = int(f.get("max_scraped", 0)) or max(target_count * 30, 800)
+    # Cherche plus longtemps que l'origine (400) MAIS borne raisonnable: au-dela le scrape de
+    # catalogues (1 page/boutique) devient tres long. Reglable via max_scraped.
+    max_scraped = int(f.get("max_scraped", 0)) or max(target_count * 30, 500)
     # Page vide = block Datadome transitoire. On retente 1 fois avec une courte pause, mais
     # on ABANDONNE VITE (5 echecs) pour rendre les resultats deja trouves au lieu de faire
     # patienter l'utilisateur ~4min. Avant: 12 echecs avec backoff jusqu'a 12s = trop long.
@@ -1783,11 +1783,10 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         _has_proxies = False
     # STALL scale sur la CIBLE: pour un gros volume (ex 1000 boutiques) il faut tolerer beaucoup
     # de scan sans keep avant d'abandonner, sinon on s'arrete a ~120 et on n'atteint jamais 1000.
-    # RELEVE (cherche plus longtemps): plancher 500 sans proxy (avant 120), 600 avec. On tolere
-    # bcp plus de boutiques scrapees sans "keep" avant d'abandonner => creuse les niches a faible
-    # rendement (drop rare) au lieu de couper a 120. + lent sans proxy (risque block) mais c'est
-    # le choix demande. Reglable via scrape_stall.
-    stall_limit = int(f.get("scrape_stall", 0)) or max(600 if _has_proxies else 500, target_count)
+    # Cherche plus longtemps qu'a l'origine (120) mais BORNE: chaque "scan sans keep" = 1 catalogue
+    # scrape (1 page), donc 200-300 = deja ~1-2 min. Au-dela l'UI parait "bloquee". Reglable via
+    # scrape_stall (monte-le si tu acceptes des runs plus longs sur niches a faible rendement).
+    stall_limit = int(f.get("scrape_stall", 0)) or max(300 if _has_proxies else 200, target_count)
     scraped_at_last_keep = 0
     # boucle jusqu'a collect_target, epuisement Etsy, ou budget atteint.
     while len(shops) < collect_target and pg < PAGE_CAP and scraped < max_scraped and not _stopped(stop):
