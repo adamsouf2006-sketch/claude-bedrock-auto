@@ -916,7 +916,13 @@ def ai_enrich_shops(shops, f, stop=None):
     # strict au mot-cle. Le gate strict (match==true exige) jetait presque tous les candidats
     # => 0 resultat. En mode clone on garde le label/niche IA mais on NE jette PAS sur le match.
     clone_mode = bool(f.get("clone_mode"))
-    strict = bool(query) and coverage >= 0.5 and not clone_mode
+    # KEEP_MIXED (chasse au drop): un DROPSHIPPER a souvent un catalogue HETEROCLITE (cuisine +
+    # autres trucs) => le filtre "majorite des produits dans la niche" l'EXCLUT a tort (il ne
+    # garde que les boutiques pur-niche = souvent de vrais artisans). Quand on chasse le drop, on
+    # NE jette PAS sur le match niche: on garde les catalogues mixtes (le catalogue heteroclite est
+    # justement un signal drop) pour les tester par photo. Le gate dropship + la preuve image trient.
+    keep_mixed = bool(f.get("keep_mixed"))
+    strict = bool(query) and coverage >= 0.5 and not clone_mode and not keep_mixed
     kept = []
     # 1er passage: applique verdict + collecte les libelles libres par cle de regroupement
     canon_labels = {}                      # canon -> Counter(libelles bruts)
@@ -931,7 +937,7 @@ def ai_enrich_shops(shops, f, stop=None):
             kept.append(s); continue
         if not v.get("accept", True):
             continue                            # IA rejette: hors cible
-        if query and v.get("match") is not True and not clone_mode:
+        if query and v.get("match") is not True and not clone_mode and not keep_mixed:
             continue                            # match doit etre EXPLICITEMENT true (strict)
         raw = (str(v.get("niche") or "")).strip() or "Divers"
         key = niche_canon(raw) or raw.lower()
@@ -1854,6 +1860,11 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     if keyword.strip():
         f.setdefault("_query_raw", keyword.strip())   # phrase brute => match semantique fidele
     ai_used = False
+    # CHASSE AU DROP: si on gate/valide le dropship, on garde les catalogues MIXTES (un dropshipper
+    # vend souvent cuisine + autres trucs => le filtre majorite-niche l'excluait). Le test photo +
+    # le gate dropship trient ensuite. Sinon (recherche niche pure) on garde le match strict.
+    if f.get("ai_dropship_gate") or f.get("validate_ali"):
+        f.setdefault("keep_mixed", True)
     pre_enrich = list(shops)   # garde les candidats AVANT filtre IA/gate (pour le fallback jamais-0)
     # STOP: si l'utilisateur a coupe, on SAUTE le raffinage IA (gros batch OpenRouter ~30s+) et
     # la validation => on rend DIRECT les boutiques deja scrapees au lieu de "continuer".
