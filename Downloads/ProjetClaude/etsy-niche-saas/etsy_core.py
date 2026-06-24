@@ -1860,11 +1860,10 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     if keyword.strip():
         f.setdefault("_query_raw", keyword.strip())   # phrase brute => match semantique fidele
     ai_used = False
-    # CHASSE AU DROP: si on gate/valide le dropship, on garde les catalogues MIXTES (un dropshipper
-    # vend souvent cuisine + autres trucs => le filtre majorite-niche l'excluait). Le test photo +
-    # le gate dropship trient ensuite. Sinon (recherche niche pure) on garde le match strict.
-    if f.get("ai_dropship_gate") or f.get("validate_ali"):
-        f.setdefault("keep_mixed", True)
+    # NB: keep_mixed (garder catalogues mixtes) N'EST PAS auto-active: sans la regle "majorite des
+    # produits dans la niche", on gardait des boutiques SANS AUCUN rapport (perles de cire, posters,
+    # livres) => flood hors-sujet. Le match niche garde la pertinence. (keep_mixed reste dispo en
+    # option avancee pour qui veut ratisser large et trier ensuite par photo.)
     pre_enrich = list(shops)   # garde les candidats AVANT filtre IA/gate (pour le fallback jamais-0)
     # STOP: si l'utilisateur a coupe, on SAUTE le raffinage IA (gros batch OpenRouter ~30s+) et
     # la validation => on rend DIRECT les boutiques deja scrapees au lieu de "continuer".
@@ -1971,9 +1970,10 @@ def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, s
             if k and k not in merged:
                 merged[k] = s
         scanned_total["n"] += int(res.get("scraped") or 0)
-    # progress qui cumule le scanned de TOUS les mots-cles + le nb de boutiques fusionnees
+    # progress LIVE: boutiques deja fusionnees (mots-cles precedents) + celles gardees sur le
+    # mot-cle EN COURS (_m), et scanned cumule. Sinon le compteur restait a 0 tout le 1er mot-cle.
     def _prog(_m, s):
-        if progress: progress(len(merged), scanned_total["n"] + s)
+        if progress: progress(len(merged) + (_m or 0), scanned_total["n"] + s)
     kws = [keyword] + _expand_keywords(keyword)
     last = None
     for i, kw in enumerate(kws):
