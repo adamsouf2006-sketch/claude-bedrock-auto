@@ -250,26 +250,34 @@ def start_window_hider():
     # On NE deplace QUE les fenetres dont le titre contient un de ces marqueurs, pour ne
     # pas toucher les fenetres Chrome normales de l'utilisateur.
     MARKS = ("Chrome for Testing", "Chromium")
-    moved = set()
+    SW_HIDE = 0
     def _scan():
         def cb(hwnd, lparam):
-            if hwnd in moved:
+            # PAS de cache "deja vue": chromium RE-AFFICHE parfois sa fenetre apres qu'on l'a
+            # cachee (nouvel onglet, navigation) => on re-cache a CHAQUE scan tant qu'elle est
+            # visible. Si deja cachee (IsWindowVisible False), on passe (pas de travail inutile).
+            if not user32.IsWindowVisible(hwnd):
                 return True
             ttl = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(hwnd, ttl, 256)
             t = ttl.value or ""
             if any(m in t for m in MARKS):
-                moved.add(hwnd)
+                # 1) HORS-ECRAN (au cas ou ShowWindow soit ignore) PUIS 2) ShowWindow(SW_HIDE):
+                # retire la fenetre de l'ecran ET de la barre des taches (avant: deplacee hors-ecran
+                # mais l'icone restait dans le taskbar => "pages google for testing" visibles).
+                # Le rendu continue: --disable-renderer-backgrounding / --disable-backgrounding-
+                # occluded-windows (args chromium) empechent le throttling d'une fenetre cachee.
                 user32.SetWindowPos(hwnd, 0, -32000, -32000, 0, 0,
                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+                user32.ShowWindow(hwnd, SW_HIDE)
             return True
         user32.EnumWindows(WNDENUMPROC(cb), 0)
     def worker():
         while True:
             try: _scan()
             except Exception: pass
-            time.sleep(0.03)   # scan tres frequent => la fenetre est poussee hors-ecran
-                               # quasi instantanement (a peine un flash a la creation)
+            time.sleep(0.02)   # scan tres frequent => fenetre cachee quasi instantanement
+                               # (a peine un flash possible a la creation)
     threading.Thread(target=worker, daemon=True).start()
 
 # ---- extraction --------------------------------------------------------------
@@ -411,9 +419,226 @@ def _parse_shop(p):
             "price": price,
             "titles": titles[:48], "images": images[:48]}
 
+# ---- BACKEND CDP: scraping via TON VRAI Chrome (comme une extension navigateur) -------------
+# Active par SCRAPE_VIA_CHROME=1. On se connecte (CDP) au Chrome debug lance par ali_chrome.py
+# (vrai profil, vrais cookies, ta vraie empreinte/IP) et on ouvre des onglets Etsy DEDANS. Pour
+# Datadome ca ressemble a TOI qui navigues, pas a un bot d'automation => beaucoup moins de
+# blocage, pas besoin de proxy. Comme l'extension "Ultimate Web Scraper". Pagination = on ouvre
+# ?page=N en parallele (onglets), borne par SCRAPE_CDP_CONC.
+# DEFAUT ON: scraper via TON vrai Chrome (CDP) => Datadome passe SANS login ni proxy (teste:
+# 141 boutiques/3 pages). Mettre SCRAPE_VIA_CHROME=0 pour repasser sur l'ancien moteur camoufox.
+SCRAPE_VIA_CHROME = os.environ.get("SCRAPE_VIA_CHROME", "1") in ("1", "true", "yes")
+CDP_CONC = int(os.environ.get("SCRAPE_CDP_CONC", "4"))   # onglets paralleles (bas => moins de 429)
+CDP_GAP = float(os.environ.get("SCRAPE_CDP_GAP", "0.35")) # pause mini entre ouvertures d'onglet
+CDP_RETRIES = int(os.environ.get("SCRAPE_CDP_RETRIES", "3"))
+_cdp = {"pw": None, "br": None, "ctx": None}
+_cdp_throttle = {"until": 0.0}   # quand Etsy 429 => on met TOUT le scrape en pause jusqu'a ce ts
+
+class _CDPPage:
+    """Adapte le HTML recupere via CDP a l'interface attendue par _parse_search/_parse_shop
+    (scrapling: .css(), .html_content, .status)."""
+    def __init__(self, html, url):
+        from scrapling.parser import Adaptor
+        self.html_content = html or ""
+        self.status = 200 if html else 0
+        self._a = Adaptor(html, url=url) if html else None
+    def css(self, sel):
+        return self._a.css(sel) if self._a is not None else []
+
+async def _cdp_get_ctx():
+    from patchright.async_api import async_playwright
+    if _cdp["ctx"] is not None:
+        return _cdp["ctx"]
+    import ali_chrome
+    url = await asyncio.to_thread(ali_chrome.ensure_chrome)
+    cdp_url = url if (url or "").startswith("http") else "http://localhost:9222"
+    pw = await async_playwright().start()
+    br = await pw.chromium.connect_over_cdp(cdp_url, timeout=20000)
+    ctx = br.contexts[0] if br.contexts else await br.new_context()
+    _cdp.update(pw=pw, br=br, ctx=ctx)
+    return ctx
+
+async def _cdp_close():
+    for k in ("br", "pw"):
+        o = _cdp.get(k)
+        if o is not None:
+            try: await (o.close() if k == "br" else o.stop())
+            except Exception: pass
+    _cdp.update(pw=None, br=None, ctx=None)
+
+def _is_throttled_html(status, html):
+    """429/403 (Etsy rate-limit) ou page Datadome courte => on doit ralentir/reessayer."""
+    if status in (429, 403):
+        return True
+    h = (html or "").lower()
+    if len(h) < 5000 and ("too many requests" in h or "datadome" in h
+                          or "captcha" in h or "rate limit" in h):
+        return True
+    return False
+
+async def _cdp_fetch_one(ctx, url, wait):
+    """Ouvre 1 onglet, charge l'URL, rend le HTML (str) ou None. Gere le 429/403 d'Etsy:
+    backoff exponentiel + PAUSE GLOBALE (tous les onglets attendent) pour ne pas aggraver le
+    rate-limit. Respecte une pause globale en cours avant de partir."""
+    for attempt in range(max(1, CDP_RETRIES)):
+        # respecte une pause globale posee par un 429 precedent
+        now = time.time()
+        if _cdp_throttle["until"] > now:
+            await asyncio.sleep(_cdp_throttle["until"] - now)
+        pg = None
+        try:
+            pg = await ctx.new_page()
+            resp = await pg.goto(url, wait_until="domcontentloaded", timeout=int(wait) + 20000)
+            status = getattr(resp, "status", 0) if resp is not None else 0
+            if wait:
+                await pg.wait_for_timeout(int(wait))
+            html = await pg.content()
+            if _is_throttled_html(status, html):
+                # 429/Datadome: pause GLOBALE croissante (3s, 8s, 18s) => laisse l'IP refroidir.
+                back = (3, 8, 18)[min(attempt, 2)]
+                _cdp_throttle["until"] = max(_cdp_throttle["until"], time.time() + back)
+                try: await pg.close()
+                except Exception: pass
+                await asyncio.sleep(back)
+                continue
+            return html
+        except Exception:
+            await asyncio.sleep(1.0 + attempt)
+        finally:
+            if pg is not None:
+                try: await pg.close()
+                except Exception: pass
+    return None
+
+async def _cdp_fetch_many(urls, wait):
+    """Charge les URLs par onglets, borne par CDP_CONC + STAGGER (CDP_GAP) entre ouvertures pour
+    lisser le debit (anti-429). [(url, html|None)]."""
+    ctx = await _cdp_get_ctx()
+    sem = asyncio.Semaphore(max(1, CDP_CONC))
+    async def one(i, u):
+        async with sem:
+            await asyncio.sleep(CDP_GAP * (i % max(1, CDP_CONC)))   # decale les departs
+            return u, await _cdp_fetch_one(ctx, u, wait)
+    return await asyncio.gather(*[one(i, u) for i, u in enumerate(urls)])
+
+def _cdp_pages(urls, wait):
+    """Sync: {url: _CDPPage}. Reset la connexion CDP si elle a lache (Chrome ferme/rouvert)."""
+    try:
+        pairs = _run(_cdp_fetch_many(urls, wait))
+    except Exception:
+        try: _run(_cdp_close())
+        except Exception: pass
+        try:
+            pairs = _run(_cdp_fetch_many(urls, wait))
+        except Exception:
+            return {u: _CDPPage(None, u) for u in urls}
+    return {u: _CDPPage(h, u) for u, h in pairs}
+
+def _show_debug_chrome_onscreen():
+    """Ramene la/les fenetre(s) du Chrome debug (profil dedie, lance HORS-ECRAN par ali_chrome)
+    SUR l'ecran + premier plan, pour que l'utilisateur puisse cliquer/se connecter. Cible UNIQUEMENT
+    les chrome.exe dont la ligne de commande contient notre profil dedie => ne touche PAS au Chrome
+    perso. No-op hors Windows."""
+    if not sys.platform.startswith("win"):
+        return 0
+    import ctypes, subprocess, re
+    from ctypes import wintypes
+    try:
+        import ali_chrome
+        prof_tag = os.path.basename(str(ali_chrome.PROFILE).rstrip("\\/"))
+    except Exception:
+        prof_tag = "chrome_debug"
+    # PIDs des chrome.exe lances sur NOTRE profil debug
+    pids = set()
+    try:
+        out = subprocess.run(["wmic", "process", "where", "name='chrome.exe'", "get",
+                              "ProcessId,CommandLine"], capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            if prof_tag in line:
+                m = re.search(r"(\d+)\s*$", line.strip())
+                if m: pids.add(int(m.group(1)))
+    except Exception:
+        return 0
+    if not pids:
+        return 0
+    u = ctypes.windll.user32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL = 0x0001, 0x0004, 1
+    moved = [0]
+    def cb(hwnd, _l):
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids:
+            ttl = ctypes.create_unicode_buffer(256); u.GetWindowTextW(hwnd, ttl, 256)
+            if ttl.value:                      # fenetre top-level avec titre = la fenetre navigateur
+                u.ShowWindow(hwnd, SW_SHOWNORMAL)
+                u.SetWindowPos(hwnd, 0, 120, 80, 0, 0, SWP_NOSIZE | SWP_NOZORDER)
+                u.SetForegroundWindow(hwnd)
+                moved[0] += 1
+        return True
+    u.EnumWindows(WNDENUMPROC(cb), 0)
+    return moved[0]
+
+def etsy_login_window():
+    """Ouvre une fenetre Etsy VISIBLE dans le Chrome debug (profil persistant) pour que
+    l'utilisateur se CONNECTE a Etsy + passe le 1er challenge Datadome a la main, UNE fois.
+    Apres ca, le profil garde la session => les scrapes CDP (SCRAPE_VIA_CHROME=1) passent comme
+    une vraie navigation connectee (comme l'extension). Relance le Chrome debug si besoin."""
+    try:
+        import ali_chrome
+        if not ali_chrome.chrome_exe():
+            return {"ok": False, "error": "Chrome introuvable (installe Google Chrome)"}
+        ali_chrome.ensure_chrome()                       # garantit le Chrome debug joignable
+        # 2e launch sur le MEME profil/port: Chrome ouvre l'URL dans une fenetre VISIBLE de
+        # l'instance existante (pas un 2e process) => l'utilisateur voit Etsy pour se connecter.
+        ok = ali_chrome.launch(url="https://www.etsy.com/", hidden=False)
+        # la fenetre debug est lancee HORS-ECRAN (profil deja connecte) => on la RAMENE a l'ecran
+        # UNIQUEMENT ici (bouton login manuel), JAMAIS pendant un scrape. Login facultatif: le
+        # scraping CDP marche sans compte (vrai Chrome => Datadome passe).
+        time.sleep(1.2)
+        shown = _show_debug_chrome_onscreen()
+        return {"ok": bool(ok), "error": "" if ok else "launch a echoue", "shown": shown}
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": (str(e) or repr(e))[:200], "trace": traceback.format_exc()[-400:]}
+
+def etsy_session_ok():
+    """True si le Chrome debug atteint Etsy SANS blocage Datadome (session connectee valide).
+    Sert a dire a l'utilisateur si son login a marche avant de lancer un gros scrape."""
+    if not SCRAPE_VIA_CHROME:
+        return None
+    try:
+        m = _cdp_pages(["https://www.etsy.com/search?q=test&ref=search"], SEARCH_WAIT)
+        p = list(m.values())[0]
+        h = (p.html_content or "").lower()
+        if len(h) < 5000 and ("datadome" in h or "captcha" in h):
+            return False
+        return p.css('a[href*="/shop/"]') and True or (len(h) > 20000)
+    except Exception:
+        return False
+
+def _search_shops_cdp(keyword, pages, page_start):
+    kw = keyword.strip().replace(" ", "+") or "handmade"
+    urls = [f"https://www.etsy.com/search?q={kw}&page={pg}&ref=search"
+            for pg in range(page_start, page_start + pages)]
+    pages_map = _cdp_pages(urls, SEARCH_WAIT)
+    out, seen = [], set()
+    for u in urls:
+        for nm, sample in _parse_search(pages_map.get(u)):
+            if nm and nm not in seen:
+                seen.add(nm); out.append((nm, sample))
+    return out
+
+def _shops_batch_cdp(names):
+    urls = [f"https://www.etsy.com/shop/{n}" for n in names]
+    pages_map = _cdp_pages(urls, SHOP_WAIT)
+    return {n: _parse_shop(pages_map.get(f"https://www.etsy.com/shop/{n}")) for n in names}
+
 # ---- API sync ----------------------------------------------------------------
 def scrape_search_shops(keyword, pages=1, page_start=1):
     """Pages de recherche -> [(shop_name, sample_title)]. 0 API."""
+    if SCRAPE_VIA_CHROME:
+        return _search_shops_cdp(keyword, pages, page_start)
     out, seen = [], set()
     async def go():
         kw = keyword.strip().replace(" ", "+") or "handmade"
@@ -441,17 +666,38 @@ def scrape_search_shops(keyword, pages=1, page_start=1):
 
 def scrape_shops_batch(names, wait=SHOP_WAIT):
     """Charge plusieurs boutiques EN PARALLELE (1 navigateur, pool de pages).
-    Retourne {name: {sold, months, titles}|{error}}."""
-    if not SCRAPLING_OK or not names:
+    Retourne {name: {sold, months, titles}|{error}}.
+
+    RESILIENCE CRASH: si le navigateur meurt en PLEIN batch (TargetClosedError: toutes les
+    pages concurrentes tombent d'un coup), les boutiques touchees revenaient en {error} =>
+    catalogue vide => le gate niche les jetait => 0 resultat. On RE-FETCH les boutiques tombees
+    sur browser-mort apres avoir recree la session (jusqu'a 2 passes). Les vraies erreurs
+    (404, boutique absente) ne sont PAS re-essayees (pas un crash)."""
+    if not names:
         return {}
-    async def go():
+    if SCRAPE_VIA_CHROME:
+        return _shops_batch_cdp(names)
+    if not SCRAPLING_OK:
+        return {}
+    async def fetch_set(targets):
         async def one(n):
             try:
                 p = await _afetch(f"https://www.etsy.com/shop/{n}", wait, network_idle=False)
                 return n, _parse_shop(p)
             except Exception as e:
-                return n, {"error": str(e)[:50]}
-        return dict(await asyncio.gather(*[one(n) for n in names]))
+                return n, {"error": str(e)[:80]}
+        return dict(await asyncio.gather(*[one(n) for n in targets]))
+    async def go():
+        out = await fetch_set(names)
+        # boutiques tombees sur un navigateur mort (crash mid-batch) => re-fetch sur session neuve.
+        for _ in range(2):
+            dead = [n for n, d in out.items()
+                    if d.get("error") and _is_dead(Exception(d["error"]))]
+            if not dead:
+                break
+            await _reset_session()             # session neuve avant de reprendre les tombees
+            out.update(await fetch_set(dead))
+        return out
     return _run(go())
 
 def scrape_shop(name):
@@ -490,9 +736,59 @@ def scrape_ali_search(query):
     except Exception:
         return [], False
 
+def kill_stray_browsers():
+    """Tue les 'Google Chrome for Testing' fantomes lances par scrapling/playwright et restes
+    ouverts (about:blank). _session.close() ne ferme QUE le dernier navigateur; chaque rotation
+    (_reset_session) ou crash camoufox laisse une instance derriere elle (l'erreur de close est
+    avalee) => empilement de fenetres. On les tue par le chemin ms-playwright present dans leur
+    ligne de commande => on ne touche JAMAIS au Chrome perso de l'utilisateur (autre chemin)."""
+    if not sys.platform.startswith("win"):
+        return 0
+    import subprocess, re
+    n = 0
+    try:
+        out = subprocess.run(
+            ["wmic", "process", "where", "name='chrome.exe'", "get", "ProcessId,CommandLine"],
+            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return 0
+    for line in out.splitlines():
+        if "ms-playwright" in line:
+            m = re.search(r"(\d+)\s*$", line.strip())
+            if m:
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", m.group(1)],
+                                   capture_output=True, timeout=10); n += 1
+                except Exception:
+                    pass
+    return n
+
+def cleanup_temp_profiles():
+    """Supprime les profils navigateur temporaires (playwright_chromiumdev_profile-*) laisses
+    dans %TEMP%. Chaque (re)creation de session en cree un NOUVEAU et ne le nettoie pas =>
+    accumulation sur le disque (cache, cookies, GPU cache => peut grossir a plusieurs Mo/session
+    en run reel avec images). On les efface APRES avoir tue les navigateurs (sinon dir verrouille).
+    Ne touche qu'aux dossiers du scraping (prefixe playwright_chromiumdev_profile), pas au profil
+    perso de l'utilisateur."""
+    import tempfile, glob, shutil
+    n = 0
+    base = tempfile.gettempdir()
+    for d in glob.glob(os.path.join(base, "playwright_chromiumdev_profile-*")) \
+           + glob.glob(os.path.join(base, "playwright-artifacts-*")):
+        try:
+            shutil.rmtree(d, ignore_errors=True); n += 1
+        except Exception:
+            pass
+    return n
+
 def close_session():
     global _session
     if _session is not None and _loop is not None:
         try: _run(_session.close())
         except Exception: pass
         _session = None
+    if _cdp.get("ctx") is not None:   # detache la connexion CDP (ne tue PAS ton Chrome)
+        try: _run(_cdp_close())
+        except Exception: pass
+    kill_stray_browsers()    # bute les fenetres fantomes laissees par les rotations/crashes
+    cleanup_temp_profiles()  # efface les profils temp sur disque (anti-accumulation stockage)

@@ -35,6 +35,18 @@ class H(BaseHTTPRequestHandler):
             sid = parse_qs(u.query).get("sid", [""])[0]
             ok = core.cancel_search(sid) if sid else False
             return self._send(200, json.dumps({"stopped": ok}))
+        if u.path == "/api/etsy_login":
+            # ouvre une fenetre Etsy visible dans le Chrome debug pour login + 1er Datadome
+            import scraper
+            r = scraper.etsy_login_window()
+            ok = r.get("ok") if isinstance(r, dict) else bool(r)
+            err = r.get("error", "") if isinstance(r, dict) else ""
+            return self._send(200, json.dumps({"opened": ok, "error": err,
+                "msg": "Connecte-toi a Etsy dans la fenetre ouverte, puis lance ta recherche."}))
+        if u.path == "/api/etsy_status":
+            import scraper
+            return self._send(200, json.dumps({"session_ok": scraper.etsy_session_ok(),
+                                               "via_chrome": scraper.SCRAPE_VIA_CHROME}))
         if u.path == "/api/complete_catalogs":
             q = parse_qs(u.query)
             try: lim = min(int(q.get("limit", ["50"])[0]), 300)

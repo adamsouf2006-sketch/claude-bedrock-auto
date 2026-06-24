@@ -258,6 +258,42 @@ def _vision_batch_score(image_urls):
     except Exception:
         return None
 
+def _vision_same_product(etsy_img, ali_img):
+    """Compare DEUX images (photo produit Etsy vs vignette AliExpress remontee par Lens) et juge
+    si c'est le MEME produit exact, en regardant les DETAILS (forme, proportions, anse/poignee,
+    motif, gravure, couleur, texture, accessoires) et en IGNORANT fond/lumiere/angle. Renvoie
+    True (meme produit, preuve drop), False (different => faux positif Lens), ou None (echec/incertain).
+    Concu pour rattraper l'imprecision: Lens relie souvent un produit VISUELLEMENT proche mais
+    DIFFERENT => ce 2e regard 'detail' coupe ces faux positifs."""
+    if not etsy_img or not ali_img or not vision_available():
+        return None
+    prompt = (
+        "Image 1 = photo produit d'une boutique Etsy. Image 2 = vignette d'un produit AliExpress "
+        "trouve par recherche d'image inversee. Question: est-ce EXACTEMENT le MEME produit "
+        "(meme article, pas juste 'du meme genre') ?\n"
+        "Compare les DETAILS: forme et proportions exactes, anse/poignee, decoupe, motif, "
+        "gravure/texte, couleur, texture/materiau, accessoires inclus, nombre de pieces. "
+        "IGNORE le fond, la lumiere, l'angle, le recadrage, le watermark.\n"
+        "Sois STRICT: au moindre detail qui differe (forme, motif, proportions), reponds false. "
+        "Mieux vaut rejeter un match douteux que confirmer un faux positif.\n"
+        "Renvoie UNIQUEMENT ce JSON: {\"same\":true|false,\"confidence\":0.0,\"why\":\"<5 mots>\"}"
+    )
+    txt = _ai_vision_call(prompt, [etsy_img, ali_img], max_tokens=200)
+    if not txt:
+        return None
+    try:
+        txt = txt[txt.find("{"): txt.rfind("}") + 1]
+        d = json.loads(txt)
+        same = d.get("same")
+        conf = float(d.get("confidence") or 0)
+        if same is True and conf >= 0.6:
+            return True
+        if same is False:
+            return False
+        return None                       # incertain
+    except Exception:
+        return None
+
 def shop_photo_drop_avg(image_urls, batch=6):
     """Note dropship MOYENNE sur TOUTES les photos produit d'une boutique (1 photo/produit).
     Traite par lots de `batch` (un appel vision par lot) puis moyenne ponderee par le nombre de
@@ -1666,13 +1702,24 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     pg = _cursor_get(scrape_ckey)
     shops = []; seen = set(); scraped = 0; found_total = 0; skipped_pre = 0
 
+    from collections import Counter as _Counter
+    reject_stats = _Counter()   # pourquoi les boutiques scrapees sont jetees (=> notice claire)
+
     def keep(rec):
         titles = shop_titles(rec)
-        rej, _ = catalog_reject(titles, f)   # rejet proportionnel (pas sur 1 titre isole)
-        if rej: return False
-        if rec["rate"] < f.get("min_rate", 0): return False
-        if rec["months"] > f.get("max_age_months", 999): return False
-        if rec["months"] < f.get("min_age_months", 0): return False
+        rej, reason = catalog_reject(titles, f)   # rejet proportionnel (pas sur 1 titre isole)
+        if rej:
+            reject_stats["exclure:" + (reason or "catalogue")] += 1
+            return False
+        if rec["rate"] < f.get("min_rate", 0):
+            reject_stats["ventes/mois < %g" % f.get("min_rate", 0)] += 1
+            return False
+        if rec["months"] > f.get("max_age_months", 999):
+            reject_stats["age > %g mois" % f.get("max_age_months", 999)] += 1
+            return False
+        if rec["months"] < f.get("min_age_months", 0):
+            reject_stats["age < %g mois" % f.get("min_age_months", 0)] += 1
+            return False
         return True
 
     def build(name, sample, d):
@@ -1691,16 +1738,20 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
                 "images": d.get("images") or []}   # images produit scrapees (validation dropship sans API)
 
     empty_streak = 0; nonew_streak = 0
-    # budget anti-boucle: au pire on charge ~25 boutiques par cible avant d'abandonner.
-    max_scraped = int(f.get("max_scraped", 0)) or max(target_count * 25, 400)
+    # budget anti-boucle: au pire on charge ~30 boutiques par cible avant d'abandonner.
+    # RELEVE (l'utilisateur veut CHERCHER PLUS LONGTEMPS): plancher 800 (avant 400) => creuse
+    # bien plus de boutiques avant d'arreter. Reglable via max_scraped.
+    max_scraped = int(f.get("max_scraped", 0)) or max(target_count * 30, 800)
     # Page vide = block Datadome transitoire. On retente 1 fois avec une courte pause, mais
     # on ABANDONNE VITE (5 echecs) pour rendre les resultats deja trouves au lieu de faire
     # patienter l'utilisateur ~4min. Avant: 12 echecs avec backoff jusqu'a 12s = trop long.
-    empty_limit = int(f.get("empty_streak_limit", 0)) or 3
+    # RELEVE 3->5: on retente plus les pages vides (block Datadome transitoire) avant d'abandonner
+    # => cherche plus longtemps quand l'IP est ponctuellement bloquee. Reglable.
+    empty_limit = int(f.get("empty_streak_limit", 0)) or 5
     # "plus de NOUVEAUX resultats": Etsy renvoie les MEMES boutiques (deja vues) => le stock
-    # pertinent est epuise. On coupe apres 3 paquets sans aucune nouvelle boutique => rend
-    # direct au lieu de scanner du vide.
-    nonew_limit = int(f.get("nonew_limit", 0)) or 3
+    # pertinent est epuise. RELEVE 3->6: on encaisse plus de paquets repetes avant de couper =>
+    # on continue de paginer plus loin au lieu d'abandonner des le 3e paquet. Reglable.
+    nonew_limit = int(f.get("nonew_limit", 0)) or 6
     # Nb de pages de recherche fetchees EN PARALLELE par tour (chacune ~48 boutiques).
     # Gros gain vitesse: avant 1 page/tour avec attente ~4s bloquante. Plus haut = plus
     # vite mais + de risque 403 Datadome => 5 est un bon compromis.
@@ -1732,7 +1783,11 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         _has_proxies = False
     # STALL scale sur la CIBLE: pour un gros volume (ex 1000 boutiques) il faut tolerer beaucoup
     # de scan sans keep avant d'abandonner, sinon on s'arrete a ~120 et on n'atteint jamais 1000.
-    stall_limit = int(f.get("scrape_stall", 0)) or max(300 if _has_proxies else 120, target_count)
+    # RELEVE (cherche plus longtemps): plancher 500 sans proxy (avant 120), 600 avec. On tolere
+    # bcp plus de boutiques scrapees sans "keep" avant d'abandonner => creuse les niches a faible
+    # rendement (drop rare) au lieu de couper a 120. + lent sans proxy (risque block) mais c'est
+    # le choix demande. Reglable via scrape_stall.
+    stall_limit = int(f.get("scrape_stall", 0)) or max(600 if _has_proxies else 500, target_count)
     scraped_at_last_keep = 0
     # boucle jusqu'a collect_target, epuisement Etsy, ou budget atteint.
     while len(shops) < collect_target and pg < PAGE_CAP and scraped < max_scraped and not _stopped(stop):
@@ -1800,6 +1855,7 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     if keyword.strip():
         f.setdefault("_query_raw", keyword.strip())   # phrase brute => match semantique fidele
     ai_used = False
+    pre_enrich = list(shops)   # garde les candidats AVANT filtre IA/gate (pour le fallback jamais-0)
     # STOP: si l'utilisateur a coupe, on SAUTE le raffinage IA (gros batch OpenRouter ~30s+) et
     # la validation => on rend DIRECT les boutiques deja scrapees au lieu de "continuer".
     if f.get("use_ai", True) and ai_available() and shops and not _stopped(stop):
@@ -1817,10 +1873,40 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
             # faux positifs (Lens a remonte un lien hasardeux mais produit pas vraiment sourcable).
             shops = [s for s in shops if (s.get("dropship_confirmed")
                      if s.get("dropship_confirmed") is not None else s.get("ali_validated"))]
+    # FALLBACK "JAMAIS QUASI-VIDE" (comme le clone finder): le gate niche peut rejeter la
+    # quasi-totalite des boutiques scrapees => l'utilisateur voit 1/1000. On complete jusqu'a la
+    # cible avec les MEILLEURS candidats restants (deja en-niche), TRIES par score drop, marques
+    # below_threshold. MAIS: si le GATE DROP est actif (ai_dropship_gate), l'utilisateur veut
+    # QUE des dropshippers => on N'AJOUTE PAS d'artisans en remplissage (le fallback polluerait
+    # la liste pure de drops). Vaut pour N'IMPORTE QUELLE niche. Desactivable via no_fallback.
+    if not f.get("no_fallback") and not f.get("ai_dropship_gate") \
+       and len(shops) < target_count and pre_enrich:
+        have = {id(s) for s in shops}
+        for s in pre_enrich:
+            s.setdefault("ai_profile_drop", profile_drop_score(s))
+        extra = sorted((s for s in pre_enrich if id(s) not in have),
+                       key=lambda x: -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0))
+        for s in extra:
+            if len(shops) >= target_count:
+                break
+            s["below_threshold"] = True
+            shops.append(s)
+    # TRI par score drop desc (meilleurs dropship en tete), puis ventes/mois — comme clone finder.
+    shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
+                              -x.get("rate", 0)))
     res = {"source": "scrape", "api_used": 0, "scraped": scraped,
            "found": found_total, "skipped_pre": skipped_pre, "matched": len(shops),
            "ai_used": ai_used, "ali_used": ali_used, "ai_available": ai_available(),
-           "quota_remaining": _remaining["today"], "clusters": [], "shops": shops}
+           "quota_remaining": _remaining["today"], "clusters": [], "shops": shops,
+           "reject_stats": dict(reject_stats)}
+    # NOTICE ACTIONNABLE: quand peu/pas de resultats malgre bcp de boutiques scrapees, on dit
+    # EXACTEMENT quel filtre a tue le plus de boutiques (au lieu d'un "assouplis les filtres"
+    # generique). L'utilisateur sait quoi decocher/relever pour debloquer.
+    if scraped >= 20 and len(shops) < max(3, target_count // 10) and reject_stats:
+        top = sorted(reject_stats.items(), key=lambda kv: -kv[1])[:3]
+        detail = ", ".join("%s (%d)" % (k, v) for k, v in top)
+        res["notice"] = ("%d boutiques scrapees, %d gardees. Principaux filtres qui rejettent: "
+                         "%s. Decoche/relache ce filtre pour debloquer." % (scraped, len(shops), detail))
     # coupe a EXACTEMENT target_count + diversifie les niches
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
 
@@ -1912,8 +1998,13 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     exhausted = False; reset_tried = False; fail_streak = 0
     # ANTI-GASPILLAGE credits: si on a deja depense un gros budget SANS trouver une
     # seule boutique (filtres trop stricts / mot-cle sans jeunes boutiques), inutile
-    # de cramer les 500 credits => on s'arrete tot et on previent l'utilisateur.
-    no_match_budget = int(f.get("no_match_budget", 0)) or min(max_api, 150)
+    # de cramer le budget => on s'arrete et on previent l'utilisateur.
+    # INSISTANCE (comme le clone finder): les boutiques DROP sont RARES dans une niche; un
+    # seuil a 150 faisait abandonner apres 2-3 trouvees alors qu'Etsy a des milliers de pages
+    # a creuser. On scale le budget "sans match" sur la cible (creuse bcp plus profond avant
+    # d'abandonner) tout en restant borne par max_api (jamais plus que le quota alloue au run).
+    # Reglable via no_match_budget; baisse-le pour economiser, monte-le pour creuser plus.
+    no_match_budget = int(f.get("no_match_budget", 0)) or min(max_api, max(target_count * 2, 600))
     aborted_no_match = False
     last_match_credits = 0   # credits depenses au moment de la derniere boutique gardee
     # SUR-ECHANTILLONNAGE: l'IA (match) et la validation AliExpress filtrent APRES la boucle.
@@ -2038,6 +2129,7 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     # 3) raffinage IA (GLM gratuit): juge + nomme la niche + verdict dropship
     # STOP: on saute IA + validation si coupe => rend direct les boutiques deja trouvees.
     ai_used = False
+    pre_enrich = list(shops)   # candidats AVANT filtre IA/gate (pour le fallback jamais-0)
     if not _stopped(stop):
         shops, ai_used = ai_enrich_shops(shops, f, stop=stop)
     # 4) validation dropship AliExpress (opt-in): image/produit + fallback texte
@@ -2053,6 +2145,25 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
             shops = [s for s in shops if (s.get("dropship_confirmed")
                      if s.get("dropship_confirmed") is not None else s.get("ali_validated"))]
+    # FALLBACK "JAMAIS QUASI-VIDE" (cf clone finder): complete jusqu'a la cible avec les meilleurs
+    # candidats restants (deja en-niche), tries par score drop desc, marques below_threshold.
+    # MAIS si le GATE DROP est actif (ai_dropship_gate), on ne remplit PAS d'artisans => liste
+    # PURE de dropshippers (ce que veut l'utilisateur). Vaut pour n'importe quelle niche.
+    if not f.get("no_fallback") and not f.get("ai_dropship_gate") \
+       and len(shops) < target_count and pre_enrich:
+        have = {id(s) for s in shops}
+        for s in pre_enrich:
+            s.setdefault("ai_profile_drop", profile_drop_score(s))
+        extra = sorted((s for s in pre_enrich if id(s) not in have),
+                       key=lambda x: -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0))
+        for s in extra:
+            if len(shops) >= target_count:
+                break
+            s["below_threshold"] = True
+            shops.append(s)
+    # TRI par score drop desc (meilleurs dropship en tete), puis ventes/mois.
+    shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
+                              -x.get("rate", 0)))
     res = {
         "listing_calls": listing_calls,
         "shop_calls": enriched_calls,
@@ -2426,6 +2537,22 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
             if drop:
                 confirmed_box["n"] = [x for x in confirmed if x.get("dropship_confirmed")]
             if progress: progress(len(confirmed_box["n"]), target_count)
+    # FALLBACK "JAMAIS 0": le gate niche dur (niche_ratio_min/niche_min) peut rejeter TOUS les
+    # candidats sur une niche etroite => 0 boutique affichee alors que l'utilisateur veut voir les
+    # N meilleures coute que coute. Si on n'atteint pas la cible, on complete avec les candidats
+    # collectes (deja filtres "match IA" a la collecte => bien similaires) restants, TRIES par
+    # score drop decroissant. Ils portent leur motif de rejet niche => l'utilisateur voit pourquoi.
+    if len(confirmed) < target_count and merged:
+        have = {id(s) for s in confirmed}
+        extra = sorted((s for s in merged if id(s) not in have),
+                       key=lambda x: -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0))
+        for s in extra:
+            if len(confirmed) >= target_count:
+                break
+            s.setdefault("dropship_score", round(s.get("ai_profile_drop") or s.get("ai_dropship") or 0, 2))
+            s.setdefault("dropship_score100", round(100 * (s.get("ai_profile_drop") or s.get("ai_dropship") or 0)))
+            s.setdefault("dropship_confirmed", False)
+            confirmed.append(s)
     # TRI final: moyenne photos drop (ou profil) desc, puis ventes/mois.
     confirmed.sort(key=lambda x: (-(x.get("photo_drop_avg") if x.get("photo_drop_avg") is not None
                                     else (x.get("ai_profile_drop") or 0)), -x.get("rate", 0)))
@@ -2646,6 +2773,23 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # PREUVE FORTE: matches confirmes sur la page produit AliExpress (vraie og:image ~=
         # photo Etsy, pas le crop Lens). Signal le + fiable de "meme produit a la source".
         s["ali_page_confirmed"] = sum(1 for m in r.get("matches", []) if m.get("page_confirmed"))
+        # COMPARAISON DETAIL (vision): Lens relie souvent un produit VISUELLEMENT proche mais
+        # DIFFERENT (=> faux positif, cf FusedVisionsHQ). On redemande a l'IA de comparer DETAIL
+        # par DETAIL la photo Etsy vs la vignette AliExpress: meme produit exact ou non. On ne
+        # compte comme PREUVE que les matches confirmes 'meme produit'. Les matches que la vision
+        # juge DIFFERENTS sont rejetes (faux positif). Uniquement si use_vision (sinon on garde le
+        # hash perceptuel deterministe). detail_same = preuves; detail_diff = faux positifs coupes.
+        s["ali_detail_same"] = 0; s["ali_detail_diff"] = 0
+        if use_vision:
+            for m in (r.get("matches", []) or []):
+                if m.get("strength") not in ("exact", "strong"):
+                    continue
+                same = _vision_same_product(m.get("src_img"), m.get("ali_img"))
+                m["detail_same"] = same
+                if same is True:
+                    s["ali_detail_same"] += 1
+                elif same is False:
+                    s["ali_detail_diff"] += 1
         # SIGNAL TEXTE (dropshippers a photos custom, ex Kitchenova): produits generiques
         # trouves sur AliExpress par TEXTE quand l'image ne matche pas. Combine avec l'IA.
         s["ali_text_hits"] = r.get("text_hits", 0)
@@ -2774,7 +2918,20 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # La confirmation page produit (vraie image source AliExpress = photo Etsy) est une PREUVE
         # IMAGE FORTE. Definie AVANT strong_proof qui s'en sert (sinon UnboundLocalError).
         page_boost = bool(s.get("ali_page_confirmed", 0) >= 1)
-        strong_proof = (cov >= 0.70) or page_boost or bool(mr is not None and mr >= 5.0)
+        # COMPARAISON DETAIL (vision): preuve = l'IA a confirme 'meme produit exact' sur >=1 match.
+        # faux positif = tous les matches Lens juges DIFFERENTS par la vision (et aucun confirme).
+        detail_proof = bool(s.get("ali_detail_same", 0) >= 1)
+        # detail_killed: vision gratuite BRUITEE => on n'invalide une preuve image que si PLUSIEURS
+        # matches sont juges differents (>=2) et AUCUN confirme. 1 seul 'diff' peut etre une erreur
+        # de la vision => on ne tue pas le match dessus (sinon faux negatifs / recall a zero).
+        detail_killed = bool(use_vision and s.get("ali_detail_diff", 0) >= 2
+                             and s.get("ali_detail_same", 0) == 0 and not page_boost)
+        # PREUVE FORTE (debloque le gate age): couverture haute, OU page/detail confirme MAIS avec
+        # une couverture minimale (2 hits isoles ne suffisent pas), OU marge >=5x.
+        try: _cov_min0 = float(os.environ.get("ALI_COV_MIN", "0.25"))
+        except Exception: _cov_min0 = 0.25
+        strong_proof = (cov >= 0.70) or ((page_boost or detail_proof) and cov >= _cov_min0) \
+                       or bool(mr is not None and mr >= 5.0)
         age_gate = False
         if _age is not None and _age > 24 and not strong_proof:
             score01 = min(score01, 0.35)
@@ -2796,16 +2953,35 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # a confirmer (l'age dit "tres improbable"). Seule une vraie preuve image (strong_proof)
         # peut confirmer une boutique > 2 ans.
         profile_boost = bool(pdr is not None and pdr >= 0.8) and not age_gate
+        # GATE COUVERTURE (precision): une PREUVE image ne confirme du dropship que si une
+        # PROPORTION du catalogue matche AliExpress, pas 2 items isoles. Cas FusedVisionsHQ:
+        # artisan verre, 2/36 produits (accessoires generiques) trouves sur Ali => coverage ~5%
+        # => l'outil confirmait drop a tort. Un VRAI dropshipper a la MAJORITE de son catalogue
+        # sourcable. Seuil regle via ALI_COV_MIN (defaut 0.40 = 40% des produits testes). page_conf
+        # / detail ne valent comme preuve que si enough_cov.
+        try: cov_min = float(os.environ.get("ALI_COV_MIN", "0.25"))
+        except Exception: cov_min = 0.25
+        enough_cov = cov >= cov_min
+        img_proof = (page_boost or detail_proof or cov >= 0.70) and enough_cov
         if age_gate:
             # > 2 ans + pas de preuve image forte: pas dropship (verdict NEGATIF clair).
             s["dropship_confirmed"] = False
+        elif detail_killed:
+            # VISION DETAIL: les matches Lens sont des produits DIFFERENTS (faux positif visuel).
+            # On NE confirme PAS sur l'image. Un signal independant fort peut encore confirmer.
+            s["dropship_confirmed"] = True if (profile_boost
+                                               or (margin_boost and ad is not None and ad >= 0.5)) else False
         elif s.get("ali_validated") is None:
-            s["dropship_confirmed"] = True if profile_boost else None
+            s["dropship_confirmed"] = True if (profile_boost or (detail_proof and enough_cov)) else None
         elif s.get("ali_validated"):
+            # PREUVE IMAGE exige une couverture suffisante (proportion du catalogue), pas 2 hits
+            # isoles. + profil fort (Lens-blind) ou marge forte+IA restent des confirmations.
             if ad is None:
-                s["dropship_confirmed"] = True if (margin_boost or page_boost or profile_boost) else None
+                s["dropship_confirmed"] = True if (img_proof or profile_boost
+                                                   or (margin_boost and enough_cov)) else None
             else:
-                s["dropship_confirmed"] = (ad >= 0.4) or margin_boost or page_boost or profile_boost
+                s["dropship_confirmed"] = bool(img_proof or profile_boost
+                                               or (margin_boost and ad >= 0.5 and enough_cov))
         else:
             # pas valide par IMAGE: confirme si consensus TEXTE+IA (photo custom) OU profil fort.
             s["dropship_confirmed"] = True if (text_consensus or profile_boost) else False
