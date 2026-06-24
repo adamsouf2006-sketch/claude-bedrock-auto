@@ -1861,11 +1861,15 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         shops, ai_used = ai_enrich_shops(shops, f, stop=stop)
     # validation dropship AliExpress (opt-in), comme en mode discovery
     ali_used = False
-    if f.get("validate_ali") and shops and not _stopped(stop):
+    if f.get("validate_ali") and pre_enrich and not _stopped(stop):
         ali_used = True
         nprod = int(f.get("ali_products", 10) or 10)
         minm = int(f.get("ali_min_match", 2) or 2)
-        validate_shops_ali(shops, nprod, minm, stop=stop, use_vision=bool(f.get("use_vision")))
+        # TEST PHOTO POUR TOUTES LES BOUTIQUES (regle utilisateur "sans exception"): on valide
+        # TOUTE la niche scrapee (pre_enrich), pas seulement les survivants du gate IA => chaque
+        # boutique affichee (gate OU fallback) a un verdict photo Lens/AliExpress. Plus long mais
+        # exhaustif. (shops ⊆ pre_enrich = memes objets => le gate ci-dessous lit les verdicts.)
+        validate_shops_ali(pre_enrich, nprod, minm, stop=stop, use_vision=bool(f.get("use_vision")))
         if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
             # CONSENSUS: on ne garde que les boutiques ou Lens A TROUVE les produits sur
             # AliExpress ET (si l'IA a juge) ou l'IA estime le produit revendable. Coupe les
