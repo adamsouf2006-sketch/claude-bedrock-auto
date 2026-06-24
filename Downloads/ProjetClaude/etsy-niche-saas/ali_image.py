@@ -880,6 +880,15 @@ async def _check_lens(pg, prod):
                     dmin = dpage; vr = True
             d = _build_detail(title, results, "aliexpress", verified=vr, dmin=dmin)
             d["page_confirmed"] = bool(conf)
+            # images pour la comparaison DETAIL en aval (vision: meme produit exact ?). On garde
+            # la photo Etsy testee (src_img) + la meilleure vignette AliExpress (ali_img).
+            d["src_img"] = img
+            try:
+                _bsim, _best = sorted(((_sim(title, (r.get("txt") or "")), r) for r in results),
+                                      key=lambda x: -x[0])[0]
+                d["ali_img"] = _best.get("img") or ""
+            except Exception:
+                d["ali_img"] = ""
             _precision_gate(d)
             if _is_hit(d.get("strength")):
                 return (True, "image", d)
