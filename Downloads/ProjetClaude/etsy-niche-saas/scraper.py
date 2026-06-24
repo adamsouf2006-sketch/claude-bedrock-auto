@@ -23,6 +23,10 @@ except Exception:
 SESSION_PAGES = int(os.environ.get("SCRAPE_PAGES", "16"))   # pages paralleles (concurrence)
 SEARCH_WAIT = int(os.environ.get("SCRAPE_SEARCH_WAIT", "2600"))  # attente JS page recherche
 SHOP_WAIT = int(os.environ.get("SCRAPE_SHOP_WAIT", "1100"))      # attente JS page boutique
+# Nb de pages de catalogue boutique scrapees+fusionnees (titres pour l'IA). 1 = page d'accueil
+# seule (~48 produits). 2+ pagine pour lire TOUT le catalogue (regle utilisateur). Plus haut =
+# plus exhaustif mais + lent et + d'exposition Datadome. Reglable.
+SHOP_CATALOG_PAGES = int(os.environ.get("SCRAPE_SHOP_PAGES", "2"))
 
 # ---- anti-blocage Datadome: rotation de session + proxies optionnels --------------
 # Datadome bloque par IP + cookie de session. En recreant periodiquement le navigateur
@@ -322,9 +326,14 @@ def _parse_search(p):
             name = _shop_from_href(a.attrib.get("href"))
             if name: break
         if not name:
+            # Fallback texte = NOM D'AFFICHAGE du vendeur ("Giovanni Gulino", "J. B."), PAS le
+            # slug d'URL. L'utiliser comme /shop/<name> => 404 (espaces->%20, points) => budget
+            # scrape gaspille + 0 resultat. On ne garde le texte QUE s'il a la forme d'un vrai
+            # slug Etsy ([A-Za-z0-9_], sans espace ni point). Sinon on jette la carte.
             for e in c.css('p.v2-listing-card__shop, span[class*=shop]'):
-                name = " ".join(e.text.split())
-                if name: break
+                t = " ".join(e.text.split())
+                if t and re.fullmatch(r"[A-Za-z0-9_]+", t):
+                    name = t; break
         if name and name not in seen:
             seen.add(name); out.append((name, title))
     return out
@@ -398,6 +407,38 @@ def _parse_etsy_prices_ld(html):
                     pass
     return out
 
+# Nom de pays Etsy -> code ISO. Le scrape ne donne pas l'ISO direct (l'API si), mais la page
+# boutique expose "location":"Ville, Pays". On mappe le pays -> ISO pour reactiver le signal
+# dropship PAYS (CN/HK/TW/MO = quasi toujours du drop deguise, cf profile_drop_score). Sans ca le
+# scrape mettait country=None => OritFinds (CN) jamais flagge par le pays.
+_COUNTRY_ISO = {
+    "china": "CN", "hong kong": "HK", "taiwan": "TW", "macao": "MO", "macau": "MO",
+    "united states": "US", "united kingdom": "GB", "canada": "CA", "australia": "AU",
+    "germany": "DE", "france": "FR", "spain": "ES", "italy": "IT", "lithuania": "LT",
+    "poland": "PL", "netherlands": "NL", "turkey": "TR", "ukraine": "UA", "india": "IN",
+    "portugal": "PT", "ireland": "IE", "greece": "GR", "romania": "RO", "latvia": "LV",
+    "estonia": "EE", "czechia": "CZ", "sweden": "SE", "denmark": "DK", "belgium": "BE",
+}
+
+def _shop_country(html):
+    """Code ISO pays de la boutique depuis la page Etsy ('location':'Ville, Pays' ou
+    'shop-location'). Retourne ISO ('CN', 'US'...) si connu, sinon le nom brut, sinon ''."""
+    m = re.search(r'"location"\s*:\s*"([^"]+)"', html or "")
+    if not m:
+        m = re.search(r'shop-location[^>]*>\s*([^<]+?)\s*<', html or "")
+    if not m:
+        return ""
+    place = " ".join(m.group(1).split())
+    low = place.lower()
+    # Etsy renvoie parfois "Ville, Pays" (fiable) mais parfois "Ville, Region" (ex FR:
+    # "Paris, Ile-de-France"). On cherche d'abord un NOM DE PAYS connu n'importe ou dans la
+    # chaine (capte "China", "Hong Kong", "The Netherlands"...) => signal drop pays fiable.
+    for nm, iso in _COUNTRY_ISO.items():
+        if nm in low:
+            return iso
+    # pas de pays connu (souvent une region EU) => dernier segment brut, juste pour affichage.
+    return place.split(",")[-1].strip()
+
 def _parse_shop(p):
     if p is None:
         return {"error": "no response"}
@@ -438,8 +479,8 @@ def _parse_shop(p):
     return {"sold": sold,
             "months": int(months) if months else (int(years) * 12 if years else None),
             "is_under_1y": months is not None,
-            "price": price,
-            "titles": titles[:48], "images": images[:48]}
+            "price": price, "country": _shop_country(html),
+            "titles": titles[:150], "images": images[:150]}
 
 # ---- BACKEND CDP: scraping via TON VRAI Chrome (comme une extension navigateur) -------------
 # Active par SCRAPE_VIA_CHROME=1. On se connecte (CDP) au Chrome debug lance par ali_chrome.py
@@ -728,8 +769,39 @@ def scrape_shops_batch(names, wait=SHOP_WAIT):
     async def fetch_set(targets):
         async def one(n):
             try:
-                p = await _afetch(f"https://www.etsy.com/shop/{n}", wait, network_idle=False)
-                return n, _parse_shop(p)
+                base = f"https://www.etsy.com/shop/{n}"
+                p = await _afetch(base, wait, network_idle=False)
+                d = _parse_shop(p)
+                if d.get("error"):
+                    return n, d
+                # CATALOGUE COMPLET (regle utilisateur "l'IA doit lire TOUS les titres"): la 1re
+                # page boutique n'expose qu'une partie du catalogue. On pagine ?page=N et on FUSIONNE
+                # les titres/images (dedup) pour que l'IA juge la niche sur l'ENSEMBLE du catalogue,
+                # pas un echantillon. sold/age/prix viennent de la page 1. Borne par SHOP_CATALOG_PAGES
+                # (defaut 2: equilibre exhaustivite / vitesse / exposition Datadome).
+                seen_t = set(d.get("titles") or [])
+                imgs = d.setdefault("images", [])
+                # OPTIM: si la page 1 n'est PAS pleine (< 40 produits), le catalogue tient deja
+                # entier => inutile de paginer (evite 1 fetch/boutique = + rapide, - d'exposition
+                # Datadome). On ne pagine QUE les gros catalogues (page 1 saturee).
+                for pg in range(2, SHOP_CATALOG_PAGES + 1):
+                    if len(d["titles"]) >= 150 or len(d["titles"]) < 40:
+                        break
+                    pp = await _afetch(f"{base}?ref=pagination&page={pg}", wait, network_idle=False)
+                    dd = _parse_shop(pp)
+                    new_t = dd.get("titles") or []
+                    if dd.get("error") or not new_t:
+                        break
+                    new_i = dd.get("images") or []
+                    added = 0
+                    for i, t in enumerate(new_t):
+                        if t not in seen_t:
+                            seen_t.add(t); d["titles"].append(t)
+                            imgs.append(new_i[i] if i < len(new_i) else "")
+                            added += 1
+                    if added == 0:                  # page identique => fin du catalogue
+                        break
+                return n, d
             except Exception as e:
                 return n, {"error": str(e)[:80]}
         return dict(await asyncio.gather(*[one(n) for n in targets]))

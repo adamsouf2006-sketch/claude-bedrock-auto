@@ -345,7 +345,7 @@ def _ai_refine_chunk(chunk, query=""):
     = un support/socle, PAS 'emotional support')."""
     items = [{"id": s["id"], "age_mois": s.get("months"), "ventes_total": s.get("sold"),
               "pays": s.get("country"),
-              "titres": (s.get("titles") or [s.get("sample", "")])[:60]}
+              "titres": (s.get("titles") or [s.get("sample", "")])[:120]}
              for s in chunk]
     rel_rule = ""
     rel_field = ""
@@ -358,10 +358,21 @@ def _ai_refine_chunk(chunk, query=""):
             "de table, rangement cuisine...). 'support' = un socle physique, PAS 'emotional "
             "support'.\n"
             "METHODE match: parcours TOUS les titres de la boutique, compte combien "
-            "appartiennent VRAIMENT a la categorie cherchee. match=true SEULEMENT si la "
-            "MAJORITE (>50%) des titres relevent de cette categorie/theme. Si la boutique "
-            "vend surtout autre chose (meme si 1-2 titres collent), match=false. Sois STRICT: "
-            "mieux vaut rejeter une boutique limite que polluer les resultats avec du hors-sujet.\n"
+            "appartiennent VRAIMENT a la categorie cherchee. match=true SEULEMENT si une NETTE "
+            "MAJORITE (au moins 60%) des titres relevent de cette categorie/theme PRECIS. Si la "
+            "boutique vend surtout autre chose (meme si 1-3 titres collent), match=false. Sois TRES "
+            "STRICT: au moindre doute => match=false (mieux vaut rater une bonne boutique que montrer "
+            "du hors-sujet).\n"
+            "PIEGE A EVITER (decisif): le produit doit appartenir a la categorie EXACTE, pas juste "
+            "partager un mot generique ('organizer', 'holder', 'rack', 'storage', 'wall'...). Le "
+            "domaine compte: pour 'kitchen organizer' = rangement SPECIFIQUE CUISINE (epices, "
+            "ustensiles, vaisselle, placard/tiroir de cuisine, plan de travail). NE COMPTENT PAS et "
+            "FONT match=false si majoritaires: vase, porte-lunettes, robinet, cache-pot, deco murale, "
+            "rangement mural generique en laiton/metal, organisateur de salle de bain/bureau/"
+            "aspirateur/maquillage, objets deco en bois sans usage cuisine. Un 'organizer' ou un "
+            "'wall storage' qui n'est pas explicitement pour la CUISINE NE compte PAS.\n"
+            "Le champ 'niche' que tu renvoies DOIT etre coherent avec la categorie cherchee quand "
+            "match=true (ex doit parler de cuisine/rangement cuisine, pas de 'rangement mural laiton').\n"
         )
         rel_field = "\"match\":true,"
     prompt = (
@@ -457,7 +468,9 @@ def _ai_sig(query, shop):
     Memes titres + meme query => meme verdict => reutilisable depuis le cache."""
     import hashlib
     titles = (shop.get("titles") or [shop.get("sample", "")])[:40]
-    base = (query or "").lower() + "|" + "|".join(sorted(t.lower() for t in titles if t))
+    # PROMPT_VER: a incrementer quand on change le prompt/les regles de jugement => invalide les
+    # vieux verdicts en cache (sinon une boutique re-affichee garde l'ancienne decision laxiste).
+    base = "v3|" + (query or "").lower() + "|" + "|".join(sorted(t.lower() for t in titles if t))
     return hashlib.md5(base.encode("utf-8", "replace")).hexdigest()
 
 def _ai_cache_path():
@@ -522,6 +535,21 @@ def ai_refine(shops, batch=8, query="", stop=None):
             if v is not None:
                 out[s["id"]] = v
                 vcache[_ai_sig(query, s)] = v
+        # RETRY des NON-JUGEES: le modele gratuit laisse parfois tomber des chunks (JSON casse,
+        # 429) => boutiques sans verdict. Comme le gate niche est DUR (no-verdict = jete), on
+        # retente UNE fois ces boutiques (chunks plus petits) pour ne pas jeter a tort de vraies
+        # boutiques de la niche. Ce qui reste sans verdict apres = vraie incertitude => jete.
+        missed = [s for s in todo if s["id"] not in out]
+        if missed and not _stopped(stop):
+            rechunks = [missed[i:i + max(1, batch // 2)] for i in range(0, len(missed), max(1, batch // 2))]
+            with ThreadPoolExecutor(max_workers=min(AI_WORKERS, len(rechunks))) as ex:
+                for r2 in ex.map(lambda c: _ai_refine_chunk(c, query=query), rechunks):
+                    for sid, v in (r2 or {}).items():
+                        out[sid] = v
+            for s in missed:
+                v = out.get(s["id"])
+                if v is not None:
+                    vcache[_ai_sig(query, s)] = v
         _ai_cache_save(vcache)
     return out
 
@@ -922,7 +950,14 @@ def ai_enrich_shops(shops, f, stop=None):
     # NE jette PAS sur le match niche: on garde les catalogues mixtes (le catalogue heteroclite est
     # justement un signal drop) pour les tester par photo. Le gate dropship + la preuve image trient.
     keep_mixed = bool(f.get("keep_mixed"))
-    strict = bool(query) and coverage >= 0.5 and not clone_mode and not keep_mixed
+    # GATE NICHE DUR (regle utilisateur "rien a voir avec la cuisine = jamais affiche"): des qu'un
+    # mot-cle est tape et que l'IA est dispo, on est STRICT — point. Une boutique sans verdict
+    # explicite match=true est traitee comme HORS-NICHE et jetee. On NE depend PLUS de la
+    # "couverture" (avant: si l'IA ratait >50% des boutiques, on relachait tout => fuite de vases /
+    # porte-lunettes / robinets sous 'kitchen organizer'). ai_refine retente les boutiques non
+    # jugees, donc un no-verdict residuel = vraie incertitude => on prefere jeter (qualite > quantite).
+    strict = bool(query) and not clone_mode and not keep_mixed
+    _ = coverage   # garde le calcul (diagnostic) sans l'utiliser comme assouplissement
     kept = []
     # 1er passage: applique verdict + collecte les libelles libres par cle de regroupement
     canon_labels = {}                      # canon -> Counter(libelles bruts)
@@ -1735,7 +1770,7 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
             return None
         mo = d.get("months") or 12
         return {"id": name, "name": name, "url": "https://www.etsy.com/shop/" + name,
-                "country": None, "sold": d["sold"], "months": mo,
+                "country": d.get("country") or None, "sold": d["sold"], "months": mo,
                 "rate": round(d["sold"]/mo, 1), "active": 1, "digital_pct": 0,
                 "favorers": 0, "reviews": 0, "review_avg": None, "accepts_custom": None,
                 "sample": (d["titles"][0] if d["titles"] else sample),
@@ -1859,59 +1894,17 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         f["_query"] = _kw_tr or keyword
     if keyword.strip():
         f.setdefault("_query_raw", keyword.strip())   # phrase brute => match semantique fidele
-    ai_used = False
-    # NB: keep_mixed (garder catalogues mixtes) N'EST PAS auto-active: sans la regle "majorite des
-    # produits dans la niche", on gardait des boutiques SANS AUCUN rapport (perles de cire, posters,
-    # livres) => flood hors-sujet. Le match niche garde la pertinence. (keep_mixed reste dispo en
-    # option avancee pour qui veut ratisser large et trier ensuite par photo.)
-    pre_enrich = list(shops)   # garde les candidats AVANT filtre IA/gate (pour le fallback jamais-0)
-    # STOP: si l'utilisateur a coupe, on SAUTE le raffinage IA (gros batch OpenRouter ~30s+) et
-    # la validation => on rend DIRECT les boutiques deja scrapees au lieu de "continuer".
-    if f.get("use_ai", True) and ai_available() and shops and not _stopped(stop):
-        shops, ai_used = ai_enrich_shops(shops, f, stop=stop)
-    n_after_ai = len(shops)   # survivants du match niche + gate dropship (avant validation/fallback)
-    # validation dropship AliExpress (opt-in), comme en mode discovery
-    ali_used = False
-    if f.get("validate_ali") and pre_enrich and not _stopped(stop):
-        ali_used = True
-        nprod = int(f.get("ali_products", 10) or 10)
-        minm = int(f.get("ali_min_match", 2) or 2)
-        # TEST PHOTO POUR TOUTES LES BOUTIQUES (regle utilisateur "sans exception"): on valide
-        # TOUTE la niche scrapee (pre_enrich), pas seulement les survivants du gate IA => chaque
-        # boutique affichee (gate OU fallback) a un verdict photo Lens/AliExpress. Plus long mais
-        # exhaustif. (shops ⊆ pre_enrich = memes objets => le gate ci-dessous lit les verdicts.)
-        validate_shops_ali(pre_enrich, nprod, minm, stop=stop, use_vision=bool(f.get("use_vision")))
-        if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
-            # CONSENSUS: on ne garde que les boutiques ou Lens A TROUVE les produits sur
-            # AliExpress ET (si l'IA a juge) ou l'IA estime le produit revendable. Coupe les
-            # faux positifs (Lens a remonte un lien hasardeux mais produit pas vraiment sourcable).
-            shops = [s for s in shops if (s.get("dropship_confirmed")
-                     if s.get("dropship_confirmed") is not None else s.get("ali_validated"))]
-    # FALLBACK "JAMAIS QUASI-VIDE" (comme le clone finder): le gate niche peut rejeter la
-    # quasi-totalite des boutiques scrapees => l'utilisateur voit 1/1000. On complete jusqu'a la
-    # cible avec les MEILLEURS candidats restants (deja en-niche), TRIES par score drop, marques
-    # below_threshold. MAIS: si le GATE DROP est actif (ai_dropship_gate), l'utilisateur veut
-    # QUE des dropshippers => on N'AJOUTE PAS d'artisans en remplissage (le fallback polluerait
-    # la liste pure de drops). Vaut pour N'IMPORTE QUELLE niche. Desactivable via no_fallback.
-    if not f.get("no_fallback") and not f.get("ai_dropship_gate") \
-       and len(shops) < target_count and pre_enrich:
-        have = {id(s) for s in shops}
-        for s in pre_enrich:
-            s.setdefault("ai_profile_drop", profile_drop_score(s))
-        extra = sorted((s for s in pre_enrich if id(s) not in have),
-                       key=lambda x: -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0))
-        for s in extra:
-            if len(shops) >= target_count:
-                break
-            s["below_threshold"] = True
-            shops.append(s)
-    # TRI par score drop desc (meilleurs dropship en tete), puis ventes/mois — comme clone finder.
-    shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
-                              -x.get("rate", 0)))
-    # FUNNEL: ou passent les boutiques entre le scrape et le resultat (transparence: l'utilisateur
-    # voit que 283->6 vient des filtres, pas d'un bug).
-    funnel = {"scrapees": scraped, "en_niche_apres_filtres": len(pre_enrich),
-              "match_niche_et_gate_drop": n_after_ai, "affichees": len(shops)}
+    # EQUIPE IA (agents.py): le COACH distribue le travail aux agents (SCOUT niche -> CHASSEUR
+    # image + JUGE vision -> ARBITRE) et rend la liste finale. Toute la logique niche/drop/gate
+    # vit maintenant dans l'orchestrateur (une seule direction), plus eparpillee ici.
+    import agents
+    team = agents.orchestrate(shops, f, stop=stop, progress=progress) if shops else \
+        {"shops": [], "niche_pool": [], "ai_used": False, "ali_used": False, "api": 0,
+         "funnel": {"scrapees_ou_recues": 0, "en_niche": 0, "drop_confirme": 0, "affichees": 0}}
+    shops = team["shops"]; ai_used = team["ai_used"]; ali_used = team["ali_used"]
+    tf = team["funnel"]
+    funnel = {"scrapees": scraped, "en_niche_apres_filtres": tf["en_niche"],
+              "match_niche_et_gate_drop": tf["drop_confirme"], "affichees": tf["affichees"]}
     res = {"source": "scrape", "api_used": 0, "scraped": scraped,
            "found": found_total, "skipped_pre": skipped_pre, "matched": len(shops),
            "ai_used": ai_used, "ali_used": ali_used, "ai_available": ai_available(),
@@ -1920,14 +1913,14 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     # NOTICE FUNNEL: quand peu de resultats, on montre OU ca coupe (keep filtres -> match niche ->
     # gate drop) + le filtre keep le plus mordant. L'utilisateur sait quoi relacher.
     if scraped >= 20 and len(shops) < max(3, target_count // 10):
-        bits = ["%d scrapees" % scraped, "%d en-niche" % len(pre_enrich),
-                "%d apres match+gate drop" % n_after_ai, "%d affichees" % len(shops)]
-        msg = "Entonnoir: " + " -> ".join(bits) + "."
+        bits = ["%d scrapees" % scraped, "%d en-niche" % tf["en_niche"],
+                "%d drop confirme" % tf["drop_confirme"], "%d affichees" % len(shops)]
+        msg = "Entonnoir equipe IA: " + " -> ".join(bits) + "."
         if reject_stats:
             top = sorted(reject_stats.items(), key=lambda kv: -kv[1])[:2]
             msg += " Filtres keep qui coupent le + : " + ", ".join("%s (%d)" % (k, v) for k, v in top) + "."
-        if n_after_ai < max(3, len(pre_enrich) // 4):
-            msg += " Beaucoup sont coupees au match niche / gate drop: baisse dropship_min ou decoche le gate."
+        if tf["drop_confirme"] < max(3, tf["en_niche"] // 4):
+            msg += " Beaucoup sont en-niche mais SANS preuve drop (image): decoche 'ne garder que validees' pour les voir."
         res["notice"] = msg
     # coupe a EXACTEMENT target_count + diversifie les niches
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
@@ -1983,7 +1976,7 @@ def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, s
     # mot-cle EN COURS (_m), et scanned cumule. Sinon le compteur restait a 0 tout le 1er mot-cle.
     def _prog(_m, s):
         if progress: progress(len(merged) + (_m or 0), scanned_total["n"] + s)
-    kws = [keyword] + _expand_keywords(keyword)
+    kws = [keyword] + _expand_keywords(keyword, n=20)   # plus de sous-requetes => atteint la cible
     used = []
     last = None
     # BUDGETS GLOBAUX: sans bornes, 13 mots-cles x ~200 catalogues x IA ~30s => >5 min (UI parait
@@ -1991,8 +1984,12 @@ def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, s
     # mots-cles. Reglables via time_budget_s / total_scrape_budget.
     import time as _t
     t_start = _t.time()
-    time_budget = float(f.get("time_budget_s", 0)) or 240.0           # ~4 min max
-    scan_budget = int(f.get("total_scrape_budget", 0)) or max(target_count * 15, 300)
+    # PERSISTANCE (regle utilisateur "on ne s'arrete pas tant que je n'ai pas ce que je cherche"):
+    # le gate niche DUR + le gate drop rejettent la majorite => il faut scanner LARGE pour atteindre
+    # la cible. Budgets releves: on cherche jusqu'a ~10 min / target*40 catalogues avant de rendre.
+    # Le streaming progress evite l'effet "UI bloquee". Reglables (time_budget_s / total_scrape_budget).
+    time_budget = float(f.get("time_budget_s", 0)) or 600.0           # ~10 min max
+    scan_budget = int(f.get("total_scrape_budget", 0)) or max(target_count * 40, 600)
 
     class _DeadlineStop:
         """stop combine: declenche si l'utilisateur coupe OU si la deadline globale est depassee.
@@ -2242,44 +2239,15 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     _cursor_set(ckey, 0 if exhausted else pg)
     candidates = processed
     shops.sort(key=lambda x: -x["rate"])
-    # 3) raffinage IA (GLM gratuit): juge + nomme la niche + verdict dropship
-    # STOP: on saute IA + validation si coupe => rend direct les boutiques deja trouvees.
-    ai_used = False
-    pre_enrich = list(shops)   # candidats AVANT filtre IA/gate (pour le fallback jamais-0)
-    if not _stopped(stop):
-        shops, ai_used = ai_enrich_shops(shops, f, stop=stop)
-    # 4) validation dropship AliExpress (opt-in): image/produit + fallback texte
-    ali_used = False
-    if f.get("validate_ali") and shops and not _stopped(stop):
-        ali_used = True
-        nprod = int(f.get("ali_products", 10) or 10)
-        minm = int(f.get("ali_min_match", 3) or 3)
-        enriched_calls += validate_shops_ali(shops, nprod, minm, stop=stop,
-                                             use_vision=bool(f.get("use_vision")))
-        # gate seulement si AliExpress n'a PAS bloque (sinon on garderait 0 boutique).
-        # CONSENSUS Lens+IA (dropship_confirmed) pour couper les faux positifs.
-        if f.get("ali_gate", True) and not any(s.get("ali_blocked") for s in shops) and not _stopped(stop):
-            shops = [s for s in shops if (s.get("dropship_confirmed")
-                     if s.get("dropship_confirmed") is not None else s.get("ali_validated"))]
-    # FALLBACK "JAMAIS QUASI-VIDE" (cf clone finder): complete jusqu'a la cible avec les meilleurs
-    # candidats restants (deja en-niche), tries par score drop desc, marques below_threshold.
-    # MAIS si le GATE DROP est actif (ai_dropship_gate), on ne remplit PAS d'artisans => liste
-    # PURE de dropshippers (ce que veut l'utilisateur). Vaut pour n'importe quelle niche.
-    if not f.get("no_fallback") and not f.get("ai_dropship_gate") \
-       and len(shops) < target_count and pre_enrich:
-        have = {id(s) for s in shops}
-        for s in pre_enrich:
-            s.setdefault("ai_profile_drop", profile_drop_score(s))
-        extra = sorted((s for s in pre_enrich if id(s) not in have),
-                       key=lambda x: -(x.get("ai_profile_drop") or x.get("ai_dropship") or 0))
-        for s in extra:
-            if len(shops) >= target_count:
-                break
-            s["below_threshold"] = True
-            shops.append(s)
-    # TRI par score drop desc (meilleurs dropship en tete), puis ventes/mois.
-    shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
-                              -x.get("rate", 0)))
+    # 3) EQUIPE IA (agents.py): meme orchestrateur que le mode scrape. Le COACH lance SCOUT niche
+    # (court-circuit hors-niche) -> CHASSEUR image + JUGE vision -> ARBITRE (verdict + confiance).
+    # STOP: si coupe, orchestrate saute le gros du travail et rend ce qu'on a.
+    import agents
+    team = agents.orchestrate(shops, f, stop=stop, progress=progress) if shops else \
+        {"shops": [], "niche_pool": [], "ai_used": False, "ali_used": False, "api": 0,
+         "funnel": {"scrapees_ou_recues": 0, "en_niche": 0, "drop_confirme": 0, "affichees": 0}}
+    shops = team["shops"]; ai_used = team["ai_used"]; ali_used = team["ali_used"]
+    enriched_calls += team["api"]
     res = {
         "listing_calls": listing_calls,
         "shop_calls": enriched_calls,
@@ -2400,7 +2368,7 @@ def _scan_shop_scrape(name):
         return {"error": d.get("error") or ("boutique introuvable: " + name)}
     mo = d.get("months") or 12
     return {"id": name, "name": name, "url": "https://www.etsy.com/shop/" + name,
-            "country": None, "sold": d["sold"], "months": mo,
+            "country": d.get("country") or None, "sold": d["sold"], "months": mo,
             "rate": round(d["sold"] / mo, 1),
             "titles": d.get("titles") or [], "images": d.get("images") or [],
             "sample": (d["titles"][0] if d.get("titles") else "")}

@@ -117,9 +117,10 @@
         <div class="chk"><input type="checkbox" id="only_cn_hk"> 🇨🇳 Que boutiques Chine/Hong Kong (+ de dropship)</div>
         <div class="chk"><input type="checkbox" id="fetch_titles" checked> Niche précise (catalogue complet, 2 crédits/boutique)</div>
         <div class="chk" style="padding-left:24px"><span class="tip" style="margin:0">Décoché = niche rapide depuis 1 titre (1 crédit/boutique, 2× plus de boutiques)</span></div>
-        <div class="chk"><input type="checkbox" id="use_ai"> 🤖 Classement IA (si clé)</div>
-        <div class="chk"><input type="checkbox" id="validate_ali"> 🔴 Valider sur AliExpress (image+texte)</div>
-        <div class="chk" style="padding-left:24px"><input type="checkbox" id="ali_gate" checked> Ne garder que les boutiques validées</div>
+        <div class="chk"><input type="checkbox" id="use_ai" checked> 🤖 Classement IA niche (lit TOUS les titres, jette le hors-niche)</div>
+        <div class="chk"><input type="checkbox" id="validate_ali" checked> 🔴 Valider dropship par image (Lens/AliExpress) sur CHAQUE boutique</div>
+        <div class="chk" style="padding-left:24px"><input type="checkbox" id="ali_gate" checked> Ne garder QUE niche + dropship confirmé (qualité &gt; quantité)</div>
+        <div class="chk" style="padding-left:24px"><input type="checkbox" id="use_vision_main" checked> 👁️ Analyse photos IA (compare détail produit, détecte photos IA — payant ~$0.0024)</div>
       </div>
       <div class="row">
         <div style="flex:1"><label>Produits testés/boutique</label><input id="ali_products" type="number" value="5" min="1" max="20"></div>
@@ -196,6 +197,7 @@ function params(){
     use_ai:chk("use_ai"), exclude_categories:[...sel].join(","),
     min_per_niche:val("min_per_niche"),
     validate_ali:chk("validate_ali"), ali_gate:chk("ali_gate"),
+    use_vision:chk("use_vision_main"),
     ali_products:val("ali_products"), ali_min_match:val("ali_min_match"),
     fetch_titles:chk("fetch_titles"), only_cn_hk:chk("only_cn_hk")
   });
@@ -209,9 +211,9 @@ setInterval(quota,15000);
 
 function tbl(shops){
   const hasAli=shops.some(s=>s.ali_hits!=null||s.dropship_score100!=null);
-  let h=`<table><thead><tr><th>Boutique</th><th>Pays</th><th>Ventes/mois</th><th>Total</th><th>Âge</th><th>Conf.</th>${hasAli?"<th>Dropship</th>":""}<th>Produit</th><th>AliExpress</th></tr></thead><tbody>`;
+  let h=`<table><thead><tr><th>Boutique</th><th>Pays</th><th>Ventes/mois</th><th>Total</th><th>Âge</th><th>Conf.</th><th title="Verdict équipe IA — survol pour le rapport de chaque agent">Drop IA</th>${hasAli?"<th>Dropship</th>":""}<th>Produit</th><th>AliExpress</th></tr></thead><tbody>`;
   for(const s of shops){
-    const conf=s.niche_conf!=null?Math.round(s.niche_conf*100)+"%":"—";
+    const conf=s.niche_conf!=null?Math.min(100,Math.round(s.niche_conf*100))+"%":"—";
     let aliCell="";
     if(hasAli && s.ali_hits==null){
       // mode photos IA (pas de Lens): moyenne photos + nb produits niche
@@ -247,10 +249,19 @@ function tbl(shops){
       const scTag=sc!=null?` <b style="color:${sc>=60?'#2e7d32':sc>=35?'#e08600':'#999'}">${sc}/100</b>`:"";
       aliCell=`<td>${icon}${scTag} <span class="mut">${s.ali_blocked?"bloqué":(s.ali_hits??0)}${via?" ·"+via:""}${extra}</span></td>`;
     }
+    // VERDICT EQUIPE IA: confiance drop + survol = rapport de chaque agent (meneur + executeurs)
+    const dc=s.dropship_confidence;
+    const dcTag=dc!=null?`<b style="color:${dc>=70?'#2e7d32':dc>=50?'#e08600':'#c0392b'}">${dc}%</b>`:"—";
+    const t=s.team||{};
+    const rolesTxt=[t.scout&&"🔍 SCOUT: "+t.scout, t.profiler&&"📊 PROFILER: "+t.profiler,
+      t.chasseur&&"🎯 CHASSEUR: "+t.chasseur, t.juge&&"👁️ JUGE: "+t.juge,
+      t.arbitre&&"⚖️ ARBITRE: "+t.arbitre].filter(Boolean).join("\n");
+    const reason=s.final_reason?` · ${s.final_reason}`:"";
     h+=`<tr>
       <td><a class="shop" href="${s.url}" target="_blank">${s.name||s.id}</a></td>
       <td class="mut">${s.country||"—"}</td><td><b>${s.rate}</b></td>
       <td>${s.sold}</td><td class="mut">${s.months} mo</td><td class="mut">${conf}</td>
+      <td title="${rolesTxt.replace(/"/g,'&quot;')}">${dcTag}<span class="mut">${reason}</span></td>
       ${aliCell}
       <td class="mut">${(s.sample||"").slice(0,55)}</td>
       <td>${s.ali_url?`<a class="ali" href="${s.ali_url}" target="_blank">🔴 chercher</a>`:""}</td>
