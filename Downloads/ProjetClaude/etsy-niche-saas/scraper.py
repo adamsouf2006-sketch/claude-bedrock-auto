@@ -145,10 +145,32 @@ def _ensure_loop():
             _loop = asyncio.new_event_loop()
             threading.Thread(target=_loop.run_forever, daemon=True).start()
 
+# PLAFOND DUR par operation _run: si le driver camoufox MEURT ("Connection closed while reading
+# from the driver"), la coroutine ne se resout JAMAIS => .result() sans timeout GELAIT tout le
+# scrape (UI "recherche en cours" a l'infini). On borne chaque op; au timeout on TUE la session
+# morte (force recreation au prochain appel) et on remonte une erreur recuperable que les
+# callers (scrape_search_shops/scrape_shops_batch) avalent => le run continue au lieu de geler.
+_RUN_TIMEOUT = int(os.environ.get("SCRAPE_RUN_TIMEOUT", "90"))
+
 def _run(coro):
-    """Execute une coroutine dans la boucle dediee et rend le resultat (sync)."""
+    """Execute une coroutine dans la boucle dediee et rend le resultat (sync). Borne par
+    _RUN_TIMEOUT: au-dela on considere le driver mort => reset session, on leve (recuperable)."""
     _ensure_loop()
-    return asyncio.run_coroutine_threadsafe(coro, _loop).result()
+    fut = asyncio.run_coroutine_threadsafe(coro, _loop)
+    try:
+        return fut.result(timeout=_RUN_TIMEOUT)
+    except Exception:
+        try: fut.cancel()
+        except Exception: pass
+        # driver probablement mort/fige => on force la recreation d'une session propre
+        try:
+            global _session
+            s, _session = _session, None
+            if s is not None:
+                asyncio.run_coroutine_threadsafe(s.close(), _loop)
+        except Exception:
+            pass
+        raise
 
 async def _get_session():
     global _session, _proxy_idx
@@ -676,7 +698,11 @@ def scrape_search_shops(keyword, pages=1, page_start=1):
         return res
     if not SCRAPLING_OK:
         return out
-    for nm, sample in _run(go()):
+    try:
+        found = _run(go())
+    except Exception:
+        return out                 # driver mort/timeout => rend ce qu'on a (run continue)
+    for nm, sample in found:
         if nm and nm not in seen:
             seen.add(nm); out.append((nm, sample))
     return out
@@ -718,7 +744,10 @@ def scrape_shops_batch(names, wait=SHOP_WAIT):
             await _reset_session()             # session neuve avant de reprendre les tombees
             out.update(await fetch_set(dead))
         return out
-    return _run(go())
+    try:
+        return _run(go())
+    except Exception:
+        return {n: {"error": "driver"} for n in names}   # driver mort/timeout => run continue
 
 def scrape_shop(name):
     """Compat: 1 boutique."""

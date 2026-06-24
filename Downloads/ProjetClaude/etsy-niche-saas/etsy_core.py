@@ -1984,21 +1984,46 @@ def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, s
     def _prog(_m, s):
         if progress: progress(len(merged) + (_m or 0), scanned_total["n"] + s)
     kws = [keyword] + _expand_keywords(keyword)
+    used = []
     last = None
+    # BUDGETS GLOBAUX: sans bornes, 13 mots-cles x ~200 catalogues x IA ~30s => >5 min (UI parait
+    # "bloquee"). On plafonne le TEMPS total et le nb de boutiques scrapees sur l'ensemble des
+    # mots-cles. Reglables via time_budget_s / total_scrape_budget.
+    import time as _t
+    t_start = _t.time()
+    time_budget = float(f.get("time_budget_s", 0)) or 240.0           # ~4 min max
+    scan_budget = int(f.get("total_scrape_budget", 0)) or max(target_count * 15, 300)
+
+    class _DeadlineStop:
+        """stop combine: declenche si l'utilisateur coupe OU si la deadline globale est depassee.
+        Passe a run_scrape => coupe AUSSI a l'interieur d'un mot-cle (pas seulement entre)."""
+        def __init__(self, base, deadline): self.base = base; self.deadline = deadline
+        def is_set(self):
+            return bool((self.base is not None and self.base.is_set()) or _t.time() >= self.deadline)
+    dstop = _DeadlineStop(stop, t_start + time_budget)
+
     for i, kw in enumerate(kws):
-        if _stopped(stop) or len(merged) >= target_count:
+        if _stopped(dstop) or len(merged) >= target_count:
             break
-        # cible RESTANTE pour ce mot-cle (sur-echantillonne un peu via run_scrape lui-meme)
+        if scanned_total["n"] >= scan_budget:
+            break                          # budget scrape global epuise => on rend ce qu'on a
+        used.append(kw)
         remaining = target_count - len(merged)
-        last = run_scrape(keyword=kw, target_count=remaining, filters=dict(f),
-                          progress=_prog, stop=stop)
+        # borne le scrape de CE mot-cle au budget restant (sinon il scanne tout avant de passer
+        # au suivant) ET la deadline coupe en cours via dstop.
+        f_kw = dict(f)
+        f_kw["max_scraped"] = max(60, min(int(f.get("max_scraped", 0) or 10**9),
+                                          scan_budget - scanned_total["n"]))
+        last = run_scrape(keyword=kw, target_count=remaining, filters=f_kw,
+                          progress=_prog, stop=dstop)
         _absorb(last)
+    kws = used
     shops = list(merged.values())
     shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
                               -x.get("rate", 0)))
     res = dict(last or {"source": "scrape", "clusters": []})
     res.update({"shops": shops, "matched": len(shops), "scraped": scanned_total["n"],
-                "keywords_used": kws[:len([k for k in kws])], "source": "scrape"})
+                "keywords_used": kws, "source": "scrape"})
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
 
 # ---------------- completer catalogues manquants ----------------
