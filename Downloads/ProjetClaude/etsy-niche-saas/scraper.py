@@ -506,13 +506,16 @@ def etsy_login_window():
     une vraie navigation connectee (comme l'extension). Relance le Chrome debug si besoin."""
     try:
         import ali_chrome
+        if not ali_chrome.chrome_exe():
+            return {"ok": False, "error": "Chrome introuvable (installe Google Chrome)"}
         ali_chrome.ensure_chrome()                       # garantit le Chrome debug joignable
         # 2e launch sur le MEME profil/port: Chrome ouvre l'URL dans une fenetre VISIBLE de
         # l'instance existante (pas un 2e process) => l'utilisateur voit Etsy pour se connecter.
-        ali_chrome.launch(url="https://www.etsy.com/", hidden=False)
-        return True
-    except Exception:
-        return False
+        ok = ali_chrome.launch(url="https://www.etsy.com/", hidden=False)
+        return {"ok": bool(ok), "error": "" if ok else "launch a echoue"}
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": (str(e) or repr(e))[:200], "trace": traceback.format_exc()[-400:]}
 
 def etsy_session_ok():
     """True si le Chrome debug atteint Etsy SANS blocage Datadome (session connectee valide).

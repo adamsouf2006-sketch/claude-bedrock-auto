@@ -277,7 +277,7 @@ async function etsyLogin(){
   try{
     const r=await (await fetch("/api/etsy_login")).json();
     alert(r.opened ? (r.msg||"Connecte-toi a Etsy dans la fenetre ouverte, puis reviens lancer ta recherche.")
-                   : "Impossible d'ouvrir le Chrome. Verifie qu'il est installe.");
+                   : ("Impossible d'ouvrir le Chrome: "+(r.error||"raison inconnue")));
   }catch(e){ alert("Erreur: "+e); }
 }
 async function run(){
