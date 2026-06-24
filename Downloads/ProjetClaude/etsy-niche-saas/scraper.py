@@ -428,8 +428,11 @@ def _parse_shop(p):
 # DEFAUT ON: scraper via TON vrai Chrome (CDP) => Datadome passe SANS login ni proxy (teste:
 # 141 boutiques/3 pages). Mettre SCRAPE_VIA_CHROME=0 pour repasser sur l'ancien moteur camoufox.
 SCRAPE_VIA_CHROME = os.environ.get("SCRAPE_VIA_CHROME", "1") in ("1", "true", "yes")
-CDP_CONC = int(os.environ.get("SCRAPE_CDP_CONC", "6"))   # onglets paralleles dans ton Chrome
+CDP_CONC = int(os.environ.get("SCRAPE_CDP_CONC", "4"))   # onglets paralleles (bas => moins de 429)
+CDP_GAP = float(os.environ.get("SCRAPE_CDP_GAP", "0.35")) # pause mini entre ouvertures d'onglet
+CDP_RETRIES = int(os.environ.get("SCRAPE_CDP_RETRIES", "3"))
 _cdp = {"pw": None, "br": None, "ctx": None}
+_cdp_throttle = {"until": 0.0}   # quand Etsy 429 => on met TOUT le scrape en pause jusqu'a ce ts
 
 class _CDPPage:
     """Adapte le HTML recupere via CDP a l'interface attendue par _parse_search/_parse_shop
@@ -463,30 +466,60 @@ async def _cdp_close():
             except Exception: pass
     _cdp.update(pw=None, br=None, ctx=None)
 
+def _is_throttled_html(status, html):
+    """429/403 (Etsy rate-limit) ou page Datadome courte => on doit ralentir/reessayer."""
+    if status in (429, 403):
+        return True
+    h = (html or "").lower()
+    if len(h) < 5000 and ("too many requests" in h or "datadome" in h
+                          or "captcha" in h or "rate limit" in h):
+        return True
+    return False
+
 async def _cdp_fetch_one(ctx, url, wait):
-    """Ouvre 1 onglet dans ton Chrome, charge l'URL, rend le HTML (str) ou None."""
-    pg = None
-    try:
-        pg = await ctx.new_page()
-        await pg.goto(url, wait_until="domcontentloaded", timeout=int(wait) + 20000)
-        if wait:
-            await pg.wait_for_timeout(int(wait))
-        return await pg.content()
-    except Exception:
-        return None
-    finally:
-        if pg is not None:
-            try: await pg.close()
-            except Exception: pass
+    """Ouvre 1 onglet, charge l'URL, rend le HTML (str) ou None. Gere le 429/403 d'Etsy:
+    backoff exponentiel + PAUSE GLOBALE (tous les onglets attendent) pour ne pas aggraver le
+    rate-limit. Respecte une pause globale en cours avant de partir."""
+    for attempt in range(max(1, CDP_RETRIES)):
+        # respecte une pause globale posee par un 429 precedent
+        now = time.time()
+        if _cdp_throttle["until"] > now:
+            await asyncio.sleep(_cdp_throttle["until"] - now)
+        pg = None
+        try:
+            pg = await ctx.new_page()
+            resp = await pg.goto(url, wait_until="domcontentloaded", timeout=int(wait) + 20000)
+            status = getattr(resp, "status", 0) if resp is not None else 0
+            if wait:
+                await pg.wait_for_timeout(int(wait))
+            html = await pg.content()
+            if _is_throttled_html(status, html):
+                # 429/Datadome: pause GLOBALE croissante (3s, 8s, 18s) => laisse l'IP refroidir.
+                back = (3, 8, 18)[min(attempt, 2)]
+                _cdp_throttle["until"] = max(_cdp_throttle["until"], time.time() + back)
+                try: await pg.close()
+                except Exception: pass
+                await asyncio.sleep(back)
+                continue
+            return html
+        except Exception:
+            await asyncio.sleep(1.0 + attempt)
+        finally:
+            if pg is not None:
+                try: await pg.close()
+                except Exception: pass
+    return None
 
 async def _cdp_fetch_many(urls, wait):
-    """Charge plusieurs URLs EN PARALLELE (onglets), borne par CDP_CONC. [(url, html|None)]."""
+    """Charge les URLs par onglets, borne par CDP_CONC + STAGGER (CDP_GAP) entre ouvertures pour
+    lisser le debit (anti-429). [(url, html|None)]."""
     ctx = await _cdp_get_ctx()
     sem = asyncio.Semaphore(max(1, CDP_CONC))
-    async def one(u):
+    async def one(i, u):
         async with sem:
+            await asyncio.sleep(CDP_GAP * (i % max(1, CDP_CONC)))   # decale les departs
             return u, await _cdp_fetch_one(ctx, u, wait)
-    return await asyncio.gather(*[one(u) for u in urls])
+    return await asyncio.gather(*[one(i, u) for i, u in enumerate(urls)])
 
 def _cdp_pages(urls, wait):
     """Sync: {url: _CDPPage}. Reset la connexion CDP si elle a lache (Chrome ferme/rouvert)."""
