@@ -1869,6 +1869,7 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     # la validation => on rend DIRECT les boutiques deja scrapees au lieu de "continuer".
     if f.get("use_ai", True) and ai_available() and shops and not _stopped(stop):
         shops, ai_used = ai_enrich_shops(shops, f, stop=stop)
+    n_after_ai = len(shops)   # survivants du match niche + gate dropship (avant validation/fallback)
     # validation dropship AliExpress (opt-in), comme en mode discovery
     ali_used = False
     if f.get("validate_ali") and pre_enrich and not _stopped(stop):
@@ -1907,19 +1908,27 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     # TRI par score drop desc (meilleurs dropship en tete), puis ventes/mois — comme clone finder.
     shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
                               -x.get("rate", 0)))
+    # FUNNEL: ou passent les boutiques entre le scrape et le resultat (transparence: l'utilisateur
+    # voit que 283->6 vient des filtres, pas d'un bug).
+    funnel = {"scrapees": scraped, "en_niche_apres_filtres": len(pre_enrich),
+              "match_niche_et_gate_drop": n_after_ai, "affichees": len(shops)}
     res = {"source": "scrape", "api_used": 0, "scraped": scraped,
            "found": found_total, "skipped_pre": skipped_pre, "matched": len(shops),
            "ai_used": ai_used, "ali_used": ali_used, "ai_available": ai_available(),
            "quota_remaining": _remaining["today"], "clusters": [], "shops": shops,
-           "reject_stats": dict(reject_stats)}
-    # NOTICE ACTIONNABLE: quand peu/pas de resultats malgre bcp de boutiques scrapees, on dit
-    # EXACTEMENT quel filtre a tue le plus de boutiques (au lieu d'un "assouplis les filtres"
-    # generique). L'utilisateur sait quoi decocher/relever pour debloquer.
-    if scraped >= 20 and len(shops) < max(3, target_count // 10) and reject_stats:
-        top = sorted(reject_stats.items(), key=lambda kv: -kv[1])[:3]
-        detail = ", ".join("%s (%d)" % (k, v) for k, v in top)
-        res["notice"] = ("%d boutiques scrapees, %d gardees. Principaux filtres qui rejettent: "
-                         "%s. Decoche/relache ce filtre pour debloquer." % (scraped, len(shops), detail))
+           "reject_stats": dict(reject_stats), "funnel": funnel}
+    # NOTICE FUNNEL: quand peu de resultats, on montre OU ca coupe (keep filtres -> match niche ->
+    # gate drop) + le filtre keep le plus mordant. L'utilisateur sait quoi relacher.
+    if scraped >= 20 and len(shops) < max(3, target_count // 10):
+        bits = ["%d scrapees" % scraped, "%d en-niche" % len(pre_enrich),
+                "%d apres match+gate drop" % n_after_ai, "%d affichees" % len(shops)]
+        msg = "Entonnoir: " + " -> ".join(bits) + "."
+        if reject_stats:
+            top = sorted(reject_stats.items(), key=lambda kv: -kv[1])[:2]
+            msg += " Filtres keep qui coupent le + : " + ", ".join("%s (%d)" % (k, v) for k, v in top) + "."
+        if n_after_ai < max(3, len(pre_enrich) // 4):
+            msg += " Beaucoup sont coupees au match niche / gate drop: baisse dropship_min ou decoche le gate."
+        res["notice"] = msg
     # coupe a EXACTEMENT target_count + diversifie les niches
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
 
