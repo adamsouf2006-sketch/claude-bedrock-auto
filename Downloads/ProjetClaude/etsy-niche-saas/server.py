@@ -81,7 +81,10 @@ class H(BaseHTTPRequestHandler):
             # 80% du quota restant (garde une reserve), large minimum 1500. Override via max_api.
             try: _rem = int(core.quota_remaining())
             except Exception: _rem = 5000
-            mxa = gi2("max_api", 0) or min(max(target * 60, 1500), max(int(_rem * 0.8), 300))
+            # ~2 credits/boutique gardee + overhead filtrage. target*12 large pour paginer
+            # un peu sur niche pauvre, MAIS borne a 40% du quota restant (jamais cramer le
+            # quota d'un run). L'early-abort no_match_budget stoppe tot si filon sec.
+            mxa = gi2("max_api", 0) or min(target * 12 + 100, max(int(_rem * 0.4), 300))
             if u.path == "/api/similar_stream":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")

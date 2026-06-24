@@ -39,6 +39,31 @@ def debug_ok(port=PORT):
     except Exception:
         return None
 
+def kill_stray(profile=PROFILE):
+    """Tue les Chrome debug DU PROJET (ceux lances sur notre user-data-dir dedie) restes
+    ouverts. Evite l'empilement de fenetres quand un run plante avant le close ou quand le
+    port etait occupe (=> relance = nouvelle fenetre fantome). Ne touche PAS au Chrome perso
+    de l'utilisateur (filtre sur le chemin de profil dedie)."""
+    import re
+    prof_tag = os.path.basename(profile.rstrip("\\/"))   # ex "chrome_debug"
+    n = 0
+    try:
+        out = subprocess.run(
+            ["wmic", "process", "where", "name='chrome.exe'", "get", "ProcessId,CommandLine"],
+            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return 0
+    for line in out.splitlines():
+        if prof_tag in line and "--remote-debugging-port" in line:
+            m = re.search(r"(\d+)\s*$", line.strip())
+            if m:
+                try:
+                    subprocess.run(["taskkill", "/F", "/PID", m.group(1)],
+                                   capture_output=True, timeout=10); n += 1
+                except Exception:
+                    pass
+    return n
+
 def launch(port=PORT, profile=PROFILE, url="https://lens.google.com/", hidden=False):
     """Lance le Chrome debug (non bloquant). hidden=True => fenetre HORS-ECRAN (invisible mais
     fonctionnelle: DBSC/Lens marchent car c'est un vrai Chrome, pas du headless). Retourne True
@@ -77,6 +102,9 @@ def ensure_chrome(port=PORT, profile=PROFILE, wait=18):
     faire => visible). Une fois le profil connecte, tout tourne en arriere-plan."""
     if debug_ok(port):
         return f"http://localhost:{port}"
+    # port injoignable mais des Chrome debug fantomes peuvent trainer (run plante / port
+    # occupe) => on les tue AVANT de relancer pour ne pas empiler les fenetres.
+    kill_stray(profile)
     hidden = not first_login_needed(profile)   # 1er run visible (login), ensuite hors-ecran
     if not launch(port, profile, hidden=hidden):
         return None

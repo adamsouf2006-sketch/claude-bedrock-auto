@@ -40,6 +40,13 @@ def close_browsers():
         scraper.close_session()
     except Exception:
         pass
+    # ferme aussi le Chrome debug (validation Lens) => pas de fenetre qui traine/empile
+    # apres la recherche. Relance auto au prochain run (login persiste dans le profil).
+    try:
+        import ali_chrome
+        ali_chrome.kill_stray()
+    except Exception:
+        pass
 
 ENRICH_WORKERS = 4      # appels API Etsy en parallele (+ retry 429 dans _get)
 AI_WORKERS = 8          # lots IA en parallele (failover gere par cle) — + de debit
@@ -122,7 +129,7 @@ def _openrouter_call(prompt, max_tokens, model, key):
     req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=body,
         headers={"Authorization": "Bearer " + key, "content-type": "application/json",
                  "HTTP-Referer": "https://localhost", "X-Title": "CraftPilot"})
-    r = json.load(urllib.request.urlopen(req, timeout=90))
+    r = json.load(urllib.request.urlopen(req, timeout=45))
     return r["choices"][0]["message"]["content"]
 
 def _ai_call(prompt, max_tokens=2000):
@@ -433,7 +440,7 @@ def _ai_cache_save(d):
     except Exception:
         pass
 
-def ai_refine(shops, batch=8, query=""):
+def ai_refine(shops, batch=8, query="", stop=None):
     """Cerveau du logiciel. Decoupe en lots et les traite EN PARALLELE (gros gain
     vitesse, le failover de cles reste gere par lot). Par boutique:
       - accept: vrai produit physique vendable (pas perso/digital/vetement/bijou/gadget/lourd).
@@ -456,14 +463,24 @@ def ai_refine(shops, batch=8, query=""):
             out[s["id"]] = c
         else:
             todo.append(s)
-    if todo:
+    if todo and not _stopped(stop):
         chunks = [todo[i:i + batch] for i in range(0, len(todo), batch)]
         from functools import partial
         work = partial(_ai_refine_chunk, query=query)
         new = {}
+        # STOP REACTIF: submit + as_completed (au lieu de ex.map qui bloque jusqu'au bout).
+        # Des que stop est pose on annule les chunks en attente => l'arret prend effet sans
+        # attendre la fin de TOUS les appels IA (90s chacun => plusieurs minutes avant).
+        from concurrent.futures import as_completed
         with ThreadPoolExecutor(max_workers=min(AI_WORKERS, len(chunks))) as ex:
-            for d in ex.map(work, chunks):
-                new.update(d)
+            futs = {ex.submit(work, c): c for c in chunks}
+            for fut in as_completed(futs):
+                if _stopped(stop):
+                    for f2 in futs:
+                        f2.cancel()
+                    break
+                try: new.update(fut.result())
+                except Exception: pass
         for s in todo:                          # indexe par sig pour les prochains runs
             v = new.get(s["id"])
             if v is not None:
@@ -838,7 +855,7 @@ def profile_drop_score(s):
         score = max(score, 0.90)
     return round(max(0.0, min(1.0, score)), 2)
 
-def ai_enrich_shops(shops, f):
+def ai_enrich_shops(shops, f, stop=None):
     """Applique le verdict IA aux boutiques. Retourne (shops_filtres, ai_used).
     - accept=false => boutique retiree (vrai tri intelligent).
     - ai_niche => repartition niche fiable (prioritaire sur le clustering mot-cle).
@@ -849,7 +866,7 @@ def ai_enrich_shops(shops, f):
         return shops, False
     # phrase BRUTE tapee par l'utilisateur (semantique fidele) sinon mot-cle traduit
     query = (f.get("_query_raw") or f.get("_query") or "").strip()
-    verdict = ai_refine(shops, query=query)
+    verdict = ai_refine(shops, query=query, stop=stop)
     if not verdict:
         return shops, False
     thr = float(f.get("dropship_min", 0.5))
@@ -1786,7 +1803,7 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     # STOP: si l'utilisateur a coupe, on SAUTE le raffinage IA (gros batch OpenRouter ~30s+) et
     # la validation => on rend DIRECT les boutiques deja scrapees au lieu de "continuer".
     if f.get("use_ai", True) and ai_available() and shops and not _stopped(stop):
-        shops, ai_used = ai_enrich_shops(shops, f)
+        shops, ai_used = ai_enrich_shops(shops, f, stop=stop)
     # validation dropship AliExpress (opt-in), comme en mode discovery
     ali_used = False
     if f.get("validate_ali") and shops and not _stopped(stop):
@@ -2022,7 +2039,7 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     # STOP: on saute IA + validation si coupe => rend direct les boutiques deja trouvees.
     ai_used = False
     if not _stopped(stop):
-        shops, ai_used = ai_enrich_shops(shops, f)
+        shops, ai_used = ai_enrich_shops(shops, f, stop=stop)
     # 4) validation dropship AliExpress (opt-in): image/produit + fallback texte
     ali_used = False
     if f.get("validate_ali") and shops and not _stopped(stop):
@@ -2217,7 +2234,10 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     # run_discovery repart a chaque tour sur de NOUVELLES pages => on ne re-scanne pas les
     # memes boutiques. On desactive l'early-abort (no_match_budget tres haut). Garde-fou:
     # max_rounds + plafond de credits pour ne pas tourner a l'infini si le filon est vide.
-    f["no_match_budget"] = 10 ** 9          # desactive l'arret anticipe "plus de resultat"
+    # ECONOMIE CREDITS: on ne desactive PLUS l'early-abort. Un mot-cle sterile (filon sec)
+    # doit s'arreter vite au lieu de cramer tout son per_budget a CHAQUE tour. ~120 credits
+    # sans nouvelle boutique = filon mort sur ce mot-cle. Reglable via no_match_budget.
+    f["no_match_budget"] = int(f.get("no_match_budget", 0)) or 120
     per_budget = max(200, max_api // max(len(kws), 1))
     # ROUNDS: on PAGINE LOIN (le curseur avance a chaque tour => nouvelles pages Etsy). Borne
     # haute mais la boucle s'auto-termine quand un tour entier n'ajoute AUCUNE nouvelle boutique
@@ -2277,18 +2297,23 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
     pool_target = min(max(target_count * pool_mult, target_count + 12), target_count + pool_cap)
     confirmed_box = {"n": []}                # compteur partage pour la progression live
     rnd = 0
-    while len(merged) < pool_target and rnd < max_rounds and not _stopped(stop):
+    # PLAFOND CREDITS DUR: la boucle rounds rappelle run_discovery N fois; sans ce garde-fou
+    # le total depasse largement max_api (chaque appel recevait per_budget independamment).
+    while len(merged) < pool_target and rnd < max_rounds and api_used < max_api and not _stopped(stop):
         rnd += 1
         round_added = 0
         for kw in kws:
-            if len(merged) >= pool_target or _stopped(stop):
+            if len(merged) >= pool_target or api_used >= max_api or _stopped(stop):
                 break
             if scrape_mode:
                 sub = run_scrape(keyword=kw, target_count=per_target,
                                  filters=dict(f), progress=progress, stop=stop)
             else:
+                call_budget = min(per_budget, max_api - api_used)
+                if call_budget <= 0:
+                    break
                 sub = run_discovery(keyword=kw, target_count=per_target,
-                                    max_api=per_budget, filters=dict(f), progress=progress, stop=stop)
+                                    max_api=call_budget, filters=dict(f), progress=progress, stop=stop)
             round_added += absorb(sub)
             if progress: progress(len(confirmed_box["n"]), target_count)
         if round_added == 0:                # un tour entier sans NOUVELLE boutique => filon epuise
