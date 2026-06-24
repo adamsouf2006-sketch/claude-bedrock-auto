@@ -1909,6 +1909,74 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     # coupe a EXACTEMENT target_count + diversifie les niches
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
 
+def _expand_keywords(keyword, n=12):
+    """Genere des sous-requetes Etsy liees a `keyword` pour CONTINUER a trouver de NOUVELLES
+    boutiques quand le mot-cle principal est epuise (Etsy ne sert ~300 boutiques uniques/requete).
+    IA si dispo (termes que les vendeurs Etsy utilisent vraiment), sinon modificateurs statiques."""
+    base = (keyword or "").strip()
+    if not base:
+        return []
+    out = []
+    if ai_available():
+        try:
+            txt = _ai_call(
+                "Donne " + str(n) + " requetes de recherche Etsy EN ANGLAIS, proches de \"" + base +
+                "\", qui ramenent d'AUTRES boutiques du meme univers produit (sous-types, synonymes, "
+                "categories voisines). 1-3 mots chacune, pas de doublon, pas le terme exact. "
+                "Renvoie UNIQUEMENT un JSON liste: [\"...\",\"...\"]", max_tokens=300)
+            if txt:
+                txt = txt[txt.find("["): txt.rfind("]") + 1]
+                out = [str(x).strip() for x in json.loads(txt) if str(x).strip()]
+        except Exception:
+            out = []
+    if not out:                       # repli statique: modificateurs produit generiques
+        mods = ["utensils", "storage", "organizer", "gadget", "accessories", "decor", "set",
+                "holder", "rack", "tools", "container", "mat"]
+        out = [(base + " " + m) for m in mods]
+    # dedup + retire le terme exact
+    seen, res = {base.lower()}, []
+    for k in out:
+        kl = k.lower()
+        if kl and kl not in seen:
+            seen.add(kl); res.append(k)
+    return res[:n]
+
+def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, stop=None):
+    """Comme run_scrape mais ENCHAINE des sous-requetes liees quand le mot-cle principal est
+    epuise, jusqu'a atteindre target_count (ou epuiser les mots-cles). Etsy ne sert que ~300
+    boutiques uniques par requete => pour 1000 il FAUT plusieurs requetes. Fusionne sans doublon
+    (par id/nom) et coupe a la cible. Le progress cumule sur tous les mots-cles."""
+    f = dict(filters or {})
+    merged = {}            # id/nom -> shop (dedup global cross-mot-cle)
+    scanned_total = {"n": 0}
+    def _key(s): return str(s.get("id") or s.get("name") or "").lower()
+    def _absorb(res):
+        for s in (res.get("shops") or []):
+            k = _key(s)
+            if k and k not in merged:
+                merged[k] = s
+        scanned_total["n"] += int(res.get("scraped") or 0)
+    # progress qui cumule le scanned de TOUS les mots-cles + le nb de boutiques fusionnees
+    def _prog(_m, s):
+        if progress: progress(len(merged), scanned_total["n"] + s)
+    kws = [keyword] + _expand_keywords(keyword)
+    last = None
+    for i, kw in enumerate(kws):
+        if _stopped(stop) or len(merged) >= target_count:
+            break
+        # cible RESTANTE pour ce mot-cle (sur-echantillonne un peu via run_scrape lui-meme)
+        remaining = target_count - len(merged)
+        last = run_scrape(keyword=kw, target_count=remaining, filters=dict(f),
+                          progress=_prog, stop=stop)
+        _absorb(last)
+    shops = list(merged.values())
+    shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
+                              -x.get("rate", 0)))
+    res = dict(last or {"source": "scrape", "clusters": []})
+    res.update({"shops": shops, "matched": len(shops), "scraped": scanned_total["n"],
+                "keywords_used": kws[:len([k for k in kws])], "source": "scrape"})
+    return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
+
 # ---------------- completer catalogues manquants ----------------
 def complete_catalogs(limit=50):
     """Recupere les titres des boutiques qui n'ont qu'1 titre en base (mono-titre),

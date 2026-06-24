@@ -190,7 +190,7 @@ class H(BaseHTTPRequestHandler):
                 ev = core.make_cancel(sid) if sid else None
                 try:
                     if source == "scrape":
-                        res = core.run_scrape(keyword=keyword, target_count=min(target, 1000),
+                        res = core.run_scrape_multi(keyword=keyword, target_count=min(target, 1000),
                                               filters=filters, progress=prog, stop=ev)
                     elif source == "live":
                         tgt = min(target, 1000)
@@ -225,7 +225,7 @@ class H(BaseHTTPRequestHandler):
                 if source == "cache":
                     res = core.search_cache(filters=filters, keyword=keyword)
                 elif source == "scrape":
-                    res = core.run_scrape(keyword=keyword, target_count=min(target, 1000), filters=filters)
+                    res = core.run_scrape_multi(keyword=keyword, target_count=min(target, 1000), filters=filters)
                 else:
                     tgt = min(target, 1000)
                     mxa = gi("max_api", 0) or (tgt * 6 + 100)
