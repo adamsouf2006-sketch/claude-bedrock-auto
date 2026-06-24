@@ -130,7 +130,6 @@
       <div class="cats" id="cats"></div>
     </details>
 
-    <button class="sec" onclick="etsyLogin()" title="Ouvre Etsy dans le vrai Chrome pour te connecter une fois — débloque le scraping anti-Datadome (mets SCRAPE_VIA_CHROME=1)">🔓 Connexion Etsy (anti-blocage)</button>
     <button id="go" onclick="run()">🔍 Trouver des niches</button>
     <button id="stop" class="sec" onclick="stopSearch()" style="display:none;background:#c0392b;color:#fff">⏹ Arrêter & garder les résultats</button>
     <button class="sec" onclick="exportCsv()">⬇ Export CSV</button>
@@ -272,13 +271,6 @@ function liveStat(matched,scanned,target){
     <div><b style="color:var(--acc)">${matched}</b><span>boutiques trouvées / ${target}</span></div>
     <div><b>${scanned}</b><span>analysées</span></div>
     <div style="width:100%;color:var(--mut)"><span class="spin"></span> recherche en cours… (fenêtres masquées)</div>`;
-}
-async function etsyLogin(){
-  try{
-    const r=await (await fetch("/api/etsy_login")).json();
-    alert(r.opened ? (r.msg||"Connecte-toi a Etsy dans la fenetre ouverte, puis reviens lancer ta recherche.")
-                   : ("Impossible d'ouvrir le Chrome: "+(r.error||"raison inconnue")));
-  }catch(e){ alert("Erreur: "+e); }
 }
 async function run(){
   const btn=document.getElementById("go");btn.disabled=true;btn.innerHTML='<span class="spin"></span> Recherche…';

@@ -425,7 +425,9 @@ def _parse_shop(p):
 # Datadome ca ressemble a TOI qui navigues, pas a un bot d'automation => beaucoup moins de
 # blocage, pas besoin de proxy. Comme l'extension "Ultimate Web Scraper". Pagination = on ouvre
 # ?page=N en parallele (onglets), borne par SCRAPE_CDP_CONC.
-SCRAPE_VIA_CHROME = os.environ.get("SCRAPE_VIA_CHROME", "0") in ("1", "true", "yes")
+# DEFAUT ON: scraper via TON vrai Chrome (CDP) => Datadome passe SANS login ni proxy (teste:
+# 141 boutiques/3 pages). Mettre SCRAPE_VIA_CHROME=0 pour repasser sur l'ancien moteur camoufox.
+SCRAPE_VIA_CHROME = os.environ.get("SCRAPE_VIA_CHROME", "1") in ("1", "true", "yes")
 CDP_CONC = int(os.environ.get("SCRAPE_CDP_CONC", "6"))   # onglets paralleles dans ton Chrome
 _cdp = {"pw": None, "br": None, "ctx": None}
 
@@ -499,6 +501,51 @@ def _cdp_pages(urls, wait):
             return {u: _CDPPage(None, u) for u in urls}
     return {u: _CDPPage(h, u) for u, h in pairs}
 
+def _show_debug_chrome_onscreen():
+    """Ramene la/les fenetre(s) du Chrome debug (profil dedie, lance HORS-ECRAN par ali_chrome)
+    SUR l'ecran + premier plan, pour que l'utilisateur puisse cliquer/se connecter. Cible UNIQUEMENT
+    les chrome.exe dont la ligne de commande contient notre profil dedie => ne touche PAS au Chrome
+    perso. No-op hors Windows."""
+    if not sys.platform.startswith("win"):
+        return 0
+    import ctypes, subprocess, re
+    from ctypes import wintypes
+    try:
+        import ali_chrome
+        prof_tag = os.path.basename(str(ali_chrome.PROFILE).rstrip("\\/"))
+    except Exception:
+        prof_tag = "chrome_debug"
+    # PIDs des chrome.exe lances sur NOTRE profil debug
+    pids = set()
+    try:
+        out = subprocess.run(["wmic", "process", "where", "name='chrome.exe'", "get",
+                              "ProcessId,CommandLine"], capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            if prof_tag in line:
+                m = re.search(r"(\d+)\s*$", line.strip())
+                if m: pids.add(int(m.group(1)))
+    except Exception:
+        return 0
+    if not pids:
+        return 0
+    u = ctypes.windll.user32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL = 0x0001, 0x0004, 1
+    moved = [0]
+    def cb(hwnd, _l):
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids:
+            ttl = ctypes.create_unicode_buffer(256); u.GetWindowTextW(hwnd, ttl, 256)
+            if ttl.value:                      # fenetre top-level avec titre = la fenetre navigateur
+                u.ShowWindow(hwnd, SW_SHOWNORMAL)
+                u.SetWindowPos(hwnd, 0, 120, 80, 0, 0, SWP_NOSIZE | SWP_NOZORDER)
+                u.SetForegroundWindow(hwnd)
+                moved[0] += 1
+        return True
+    u.EnumWindows(WNDENUMPROC(cb), 0)
+    return moved[0]
+
 def etsy_login_window():
     """Ouvre une fenetre Etsy VISIBLE dans le Chrome debug (profil persistant) pour que
     l'utilisateur se CONNECTE a Etsy + passe le 1er challenge Datadome a la main, UNE fois.
@@ -512,7 +559,12 @@ def etsy_login_window():
         # 2e launch sur le MEME profil/port: Chrome ouvre l'URL dans une fenetre VISIBLE de
         # l'instance existante (pas un 2e process) => l'utilisateur voit Etsy pour se connecter.
         ok = ali_chrome.launch(url="https://www.etsy.com/", hidden=False)
-        return {"ok": bool(ok), "error": "" if ok else "launch a echoue"}
+        # la fenetre debug est lancee HORS-ECRAN (profil deja connecte) => on la RAMENE a l'ecran
+        # UNIQUEMENT ici (bouton login manuel), JAMAIS pendant un scrape. Login facultatif: le
+        # scraping CDP marche sans compte (vrai Chrome => Datadome passe).
+        time.sleep(1.2)
+        shown = _show_debug_chrome_onscreen()
+        return {"ok": bool(ok), "error": "" if ok else "launch a echoue", "shown": shown}
     except Exception as e:
         import traceback
         return {"ok": False, "error": (str(e) or repr(e))[:200], "trace": traceback.format_exc()[-400:]}
