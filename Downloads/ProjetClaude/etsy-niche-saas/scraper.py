@@ -26,7 +26,7 @@ SHOP_WAIT = int(os.environ.get("SCRAPE_SHOP_WAIT", "1100"))      # attente JS pa
 # Nb de pages de catalogue boutique scrapees+fusionnees (titres pour l'IA). 1 = page d'accueil
 # seule (~48 produits). 2+ pagine pour lire TOUT le catalogue (regle utilisateur). Plus haut =
 # plus exhaustif mais + lent et + d'exposition Datadome. Reglable.
-SHOP_CATALOG_PAGES = int(os.environ.get("SCRAPE_SHOP_PAGES", "2"))
+SHOP_CATALOG_PAGES = int(os.environ.get("SCRAPE_SHOP_PAGES", "1"))
 
 # ---- anti-blocage Datadome: rotation de session + proxies optionnels --------------
 # Datadome bloque par IP + cookie de session. En recreant periodiquement le navigateur
