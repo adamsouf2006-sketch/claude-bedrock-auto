@@ -1999,6 +1999,12 @@ def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, s
             return bool((self.base is not None and self.base.is_set()) or _t.time() >= self.deadline)
     dstop = _DeadlineStop(stop, t_start + time_budget)
 
+    # DETECTION BLOCAGE/SESSION MORTE: sans proxy, apres du scraping intensif Etsy/Datadome bloque
+    # l'IP => CHAQUE recherche rend 0 (found=0). Avant: on enchainait silencieusement les 20
+    # mots-cles x 600s => l'app paraissait GELEE 10 min pour finir a 0 (le vrai "probleme" recurrent).
+    # Maintenant: si les 2 premiers mots-cles ne trouvent RIEN (0 boutique vue, pas juste filtree),
+    # on abandonne VITE avec un message clair (navigateur bloque/mort) au lieu de mouliner dans le vide.
+    blocked = False; zero_find_kw = 0
     for i, kw in enumerate(kws):
         if _stopped(dstop) or len(merged) >= target_count:
             break
@@ -2014,6 +2020,15 @@ def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, s
         last = run_scrape(keyword=kw, target_count=remaining, filters=f_kw,
                           progress=_prog, stop=dstop)
         _absorb(last)
+        # found = boutiques VUES par la recherche (avant tout filtre). 0 = recherche muette
+        # (403/blocage/session morte), pas un probleme de filtre. 2 mots-cles muets d'affilee =>
+        # blocage reel => on coupe pour ne pas geler l'UI 10 min.
+        if int((last or {}).get("found") or 0) == 0:
+            zero_find_kw += 1
+            if zero_find_kw >= 2 and not merged:
+                blocked = True; break
+        else:
+            zero_find_kw = 0
     kws = used
     shops = list(merged.values())
     shops.sort(key=lambda x: (-(x.get("ai_profile_drop") or x.get("ai_dropship") or 0),
@@ -2021,6 +2036,18 @@ def run_scrape_multi(keyword="", target_count=30, filters=None, progress=None, s
     res = dict(last or {"source": "scrape", "clusters": []})
     res.update({"shops": shops, "matched": len(shops), "scraped": scanned_total["n"],
                 "keywords_used": kws, "source": "scrape"})
+    if blocked:
+        # session navigateur morte / IP bloquee par Datadome => on l'a detecte vite. On force une
+        # session NEUVE pour le prochain essai et on previent l'utilisateur (au lieu du gel silencieux).
+        try:
+            import scraper as _sc
+            _sc.close_session(); _sc.kill_stray_browsers()
+        except Exception:
+            pass
+        res["notice"] = ("⛔ Etsy a bloque le navigateur (Datadome) ou la session est morte: 0 "
+                         "boutique vue. Sans proxy, l'IP est bloquee apres du scraping intensif. "
+                         "Attends 5-10 min OU relance l'app, puis reessaie. (Le scraping a ete coupe "
+                         "vite pour ne pas geler l'app.)")
     return finalize(res, target=target_count, min_per_niche=f.get("min_per_niche", 1))
 
 # ---------------- completer catalogues manquants ----------------
