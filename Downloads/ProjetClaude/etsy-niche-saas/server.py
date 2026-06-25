@@ -199,7 +199,14 @@ class H(BaseHTTPRequestHandler):
                         # arretait la recherche avant d'atteindre la cible demandee.
                         # budget genereux: le sur-echantillonnage (IA/AliExpress filtrent
                         # apres) demande de scanner plus de candidats pour NET >= cible.
-                        mxa = gi("max_api", 0) or (tgt * 6 + 100)
+                        # PLAFOND CREDITS (protection quota): sans borne, target 500 => ~3100 credits
+                        # AUTO => vidait le quota en silence sur une niche pauvre en drops. On plafonne
+                        # le budget AUTO a MAX_API_AUTO (defaut 400). L'utilisateur relance s'il veut
+                        # creuser plus, au lieu de tout cramer d'un coup. Un max_api explicite reste
+                        # respecte (opt-in conscient).
+                        import os as _os
+                        cap = int(_os.environ.get("MAX_API_AUTO", "400"))
+                        mxa = gi("max_api", 0) or min(tgt * 6 + 100, cap)
                         res = core.run_discovery(keyword=keyword, target_count=tgt,
                                                  max_api=mxa, filters=filters, progress=prog, stop=ev)
                     else:
@@ -228,7 +235,9 @@ class H(BaseHTTPRequestHandler):
                     res = core.run_scrape_multi(keyword=keyword, target_count=min(target, 1000), filters=filters)
                 else:
                     tgt = min(target, 1000)
-                    mxa = gi("max_api", 0) or (tgt * 6 + 100)
+                    import os as _os
+                    cap = int(_os.environ.get("MAX_API_AUTO", "400"))
+                    mxa = gi("max_api", 0) or min(tgt * 6 + 100, cap)
                     res = core.run_discovery(keyword=keyword, target_count=tgt,
                                              max_api=mxa, filters=filters)
                 return self._send(200, json.dumps(res, ensure_ascii=False))
