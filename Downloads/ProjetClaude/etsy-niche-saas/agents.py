@@ -175,14 +175,30 @@ def orchestrate(shops, f, stop=None, progress=None):
 
     # 4) decision finale
     gate = f.get("ali_gate", True) and ali_used   # gate strict seulement si l'image a tourne
+    drop_n = sum(1 for s in niche_pool if s.get("dropship_confirmed"))
+    blocked_n = sum(1 for s in niche_pool if s.get("ali_blocked"))
+    note = ""
     if gate:
         final = [s for s in niche_pool if s.get("dropship_confirmed")]
+        # FILET "JAMAIS VIDE SI NICHE TROUVEE": si le gate drop ne confirme RIEN (Lens bloque par
+        # captcha, ou produits custom non retrouves a l'image) MAIS qu'on a bien des boutiques EN
+        # NICHE, on NE rend PAS un ecran vide. On montre les boutiques cuisine triees par confiance
+        # drop, marquees below_threshold (drop non prouve par image) => l'utilisateur voit du concret
+        # (toujours dans la niche) au lieu de "Aucune boutique" apres avoir scrape 200+ boutiques.
+        if not final and niche_pool:
+            for s in niche_pool:
+                s["below_threshold"] = True
+            final = list(niche_pool)
+            note = ("Aucun drop CONFIRME par image (%s boutique(s) cuisine, Lens %s). "
+                    "On affiche les boutiques de la niche triees par probabilite de drop "
+                    "(non prouvee par image). Relance pour retenter la preuve image."
+                    % (len(niche_pool),
+                       "bloque par captcha" if blocked_n else "n'a pas retrouve les produits"))
     else:
         final = list(niche_pool)
     # tri: confiance drop desc, puis ventes/mois
     final.sort(key=lambda x: (-(x.get("dropship_confidence") or 0), -x.get("rate", 0)))
     funnel = {"scrapees_ou_recues": n_in, "en_niche": len(niche_pool),
-              "drop_confirme": sum(1 for s in niche_pool if s.get("dropship_confirmed")),
-              "affichees": len(final)}
+              "drop_confirme": drop_n, "affichees": len(final)}
     return {"shops": final, "niche_pool": niche_pool, "ai_used": ai_used,
-            "ali_used": ali_used, "api": api, "funnel": funnel}
+            "ali_used": ali_used, "api": api, "funnel": funnel, "note": note}

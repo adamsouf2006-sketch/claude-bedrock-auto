@@ -1910,6 +1910,8 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
            "ai_used": ai_used, "ali_used": ali_used, "ai_available": ai_available(),
            "quota_remaining": _remaining["today"], "clusters": [], "shops": shops,
            "reject_stats": dict(reject_stats), "funnel": funnel}
+    if team.get("note"):
+        res["notice"] = team["note"]
     # NOTICE FUNNEL: quand peu de resultats, on montre OU ca coupe (keep filtres -> match niche ->
     # gate drop) + le filtre keep le plus mordant. L'utilisateur sait quoi relacher.
     if scraped >= 20 and len(shops) < max(3, target_count // 10):
@@ -2291,6 +2293,8 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         "clusters": [],
         "shops": shops,
     }
+    if team.get("note"):
+        res["notice"] = team["note"]
     if aborted_no_match:
         res["notice"] = ("Arret anticipe apres %d credits (%d boutique(s) trouvee(s)): plus "
                          "de nouveau resultat pour ce mot-cle avec ces filtres. Assouplis "
