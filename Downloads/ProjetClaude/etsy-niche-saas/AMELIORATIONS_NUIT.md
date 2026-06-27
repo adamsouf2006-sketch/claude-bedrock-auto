@@ -30,5 +30,10 @@
   - `catalog_reject` early-exit bidirectionnel (atteint/ne peut plus atteindre le seuil) → ~3.85× sur ce filtre.
 - *(Regex de mots-clés testée puis abandonnée : 3× plus lente que le substring C-level.)*
 
+## Précision drop — faux positif vieil artisan (retour utilisateur)
+- **Bug gate** : `ai_enrich_shops` gatait sur `ai_dropship` BRUT → un vieil artisan que l'IA surnote (ex 0.7) passait le gate `ai_dropship_gate`. → gate désormais sur `ai_profile_drop` (age-aware : >4 ans plafonné à 0.20). Vieux artisans exclus.
+- **Défaut UI âge max** : passé de **120 → 24 mois**. Le drop = boutiques jeunes ; 120 (10 ans) laissait passer les vieux artisans par défaut (cause du bruit signalé). Réglable à la hausse si besoin.
+- Vérifié OK (déjà age-aware) : verdict `referee`, affichage UI (`dropship_confidence`), gate mode similar.
+
 ## Tests
 - Banc offline `tests/test_suite.py` (+ `tests/README.md`) : 129 checks couvrant niche finder (dedup, exhaustion, cache demande, pipeline complet), discover/cache, similar (parsing), détection drop (hash/grade/verdict/orchestrate), anti-429, routage serveur. 0 quota, 0 réseau, 0 régression sur 30 tours.
