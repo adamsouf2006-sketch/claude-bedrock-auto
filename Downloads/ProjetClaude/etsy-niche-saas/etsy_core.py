@@ -1032,8 +1032,16 @@ def ai_enrich_shops(shops, f, stop=None):
         if v.get("reason"):
             s["ai_reason"] = str(v["reason"])
         s["ai_profile_drop"] = profile_drop_score(s)
-        if gate_ds and s.get("ai_dropship") is not None and s["ai_dropship"] < thr:
-            continue                            # produit trop unique => pas dropship-able
+        # GATE DROPSHIP sur le signal PROFIL (age-aware), PAS sur l'IA brute: un VIEIL artisan
+        # (>4 ans) que l'IA note haut a tort (ex 0.7) est plafonne a 0.20 par la regle d'age =>
+        # il doit etre EXCLU du gate drop. Avant on gatait sur ai_dropship brut => les vieux
+        # artisans passaient (faux positif signale). On gate sur ai_profile_drop (combine
+        # ai_dropship + coherence + age + pays); repli sur l'IA brute si le profil est indecis.
+        gate_val = s.get("ai_profile_drop")
+        if gate_val is None:
+            gate_val = s.get("ai_dropship")
+        if gate_ds and gate_val is not None and gate_val < thr:
+            continue                            # profil non dropship-able (age/pays/coherence)
         kept.append(s)
     # libelle d'affichage par cle = le plus frequent (a egalite, le plus court)
     display = {k: sorted(cnt.items(), key=lambda kv: (-kv[1], len(kv[0])))[0][0]

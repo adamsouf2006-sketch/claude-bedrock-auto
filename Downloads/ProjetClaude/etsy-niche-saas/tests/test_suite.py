@@ -453,6 +453,28 @@ def test_agents():
     conf_oa, ok_oa = agents.referee(old_art)
     check("vieux artisan non confirme", (not ok_oa) and conf_oa < 0.55, str((conf_oa, ok_oa)))
 
+    # GATE ai_dropship_gate: doit filtrer sur le PROFIL age-aware, pas l'IA brute. Un vieil
+    # artisan (IA brute 0.7 mais profil 0.2) doit etre EXCLU par le gate (seuil 0.5).
+    _av_g = _e2.ai_available
+    _ar_g = _e2.ai_refine
+    _e2.ai_available = lambda: True
+    _e2.ai_refine = lambda shops, **k: {s["id"]: {"accept": True, "match": True, "niche": "Cuisine",
+                                                  "dropship": 0.7} for s in shops}
+    try:
+        young = {"id": "y", "name": "y", "country": "CN", "months": 4,
+                 "titles": ["led strip", "rgb light"]}              # jeune+CN => profil haut
+        old = {"id": "o", "name": "o", "country": "DE", "months": 94,
+               "titles": ["spice rack wood", "kitchen shelf"]}      # vieux => profil plafonne 0.2
+        kept, _u = _e2.ai_enrich_shops([young, old],
+                                       {"use_ai": True, "ai_dropship_gate": True,
+                                        "dropship_min": 0.5, "_query": "cuisine"})
+    finally:
+        _e2.ai_available = _av_g
+        _e2.ai_refine = _ar_g
+    kept_ids = {s["id"] for s in kept}
+    check("gate garde jeune drop", "y" in kept_ids, str(kept_ids))
+    check("gate exclut vieux artisan", "o" not in kept_ids, str(kept_ids))
+
     # 5) vision CONTREDIT (plus de 'differents' que 'meme') => confiance rabaissee
     s = {"ali_detail_same": 1, "ali_detail_diff": 3, "ali_validated": True,
          "country": "US", "ai_profile_drop": 0.3}
