@@ -69,8 +69,13 @@ def chasseur_et_juge(shops, f, stop=None):
         return 0
     nprod = int(f.get("ali_products", 10) or 10)
     minm = int(f.get("ali_min_match", 2) or 2)
-    api = c.validate_shops_ali(shops, nprod, minm, stop=stop,
-                               use_vision=bool(f.get("use_vision")))
+    # VISION AUTO: le juge "meme objet" (couleurs/motifs/taille, photo ignoree) est ce qui
+    # rattrape le drop a photo rebrandee. On l'ACTIVE par defaut des qu'un provider vision est
+    # dispo (sauf si l'utilisateur a explicitement decoche use_vision, ou TEAM_VISION_AUTO=0).
+    auto = (os.environ.get("TEAM_VISION_AUTO", "1") not in ("0", "false", "no")
+            and c.vision_available())
+    uv = bool(f.get("use_vision")) or auto
+    api = c.validate_shops_ali(shops, nprod, minm, stop=stop, use_vision=bool(uv))
     for s in shops:
         hits = s.get("ali_hits")
         if s.get("ali_blocked"):
@@ -110,26 +115,45 @@ def referee(s):
     prof = s.get("ai_profile_drop")
     if prof is None:
         prof = profiler(s) or 0.0
+    # SIGNAL PHOTO (regle utilisateur: "les photos pas faites a l'IA = bon indicateur que ce
+    # n'est PAS du drop"). ai_photo_drop ~ 0..1: haut = photos studio/IA/catalogue usine (indice
+    # drop), bas = vraies photos artisan (decor reel, mains, imperfections => PAS drop). None=inconnu.
+    photo = s.get("ai_photo_drop")
+    try: photo = float(photo) if photo is not None else None
+    except Exception: photo = None
+    real_photos = (photo is not None and photo < 0.35)   # photos visiblement artisanales
+
+    # PREUVE = PLUSIEURS produits (regle utilisateur: "pas avec une seule image"). Un SEUL
+    # produit juge "meme" par la vision NE suffit PAS (faux positif Lens frequent). Il faut une
+    # CORROBORATION: page produit AliExpress confirmee, OU >=2 produits independants juges
+    # identiques (vision), OU >=2 hash verifies. Un signal isole = douteux, pas confirme.
+    strong = (page_ok >= 1) or (detail_same >= 2) or (detail_same >= 1 and verified >= 1)
+    medium = (verified >= 2) or (detail_same >= 1) or (verified >= 1 and validated)
 
     conf = 0.0; reason = "aucune preuve drop"
-    if detail_same > 0 or page_ok > 0:
-        conf = 0.95; reason = "meme produit confirme sur AliExpress (vision/page)"
+    if strong:
+        conf = 0.90; reason = "meme produit retrouve sur AliExpress (plusieurs preuves)"
     elif country in c._DROPSHIP_COUNTRIES:
-        conf = 0.92; reason = "vendeur %s = usine/dropship deguise" % country
-    elif verified > 0:
-        conf = 0.80; reason = "vignette AliExpress ~= photo (hash verifie)"
+        conf = 0.88; reason = "vendeur %s = usine/dropship deguise" % country
+    elif medium:
+        conf = 0.50; reason = "1 produit ressemble a AliExpress (preuve unique insuffisante)"
     elif validated:
-        conf = 0.65; reason = "produit trouve sur AliExpress (image)"
+        conf = 0.45; reason = "image vaguement trouvee (non corrobore)"
     else:
-        # pas de preuve image -> on s'appuie sur le profil, MAIS plafonne (presomption, pas preuve)
-        conf = min(float(prof) * 0.7, 0.50)
+        conf = min(float(prof) * 0.7, 0.45)
         reason = "profil suspect (%d%%) sans preuve image" % round(100 * float(prof))
 
     # la vision contredit (produit visuellement different) => faux positif Lens probable
-    if detail_diff > 0 and detail_same == 0 and page_ok == 0:
-        conf *= 0.5; reason = "image douteuse (vision: produit different)"
-    # le profil remonte un peu une preuve image faible (coherence/pays/age concordants)
-    conf = max(conf, min(float(prof), conf + 0.15)) if conf >= 0.5 else conf
+    if detail_diff > detail_same and page_ok == 0:
+        conf = min(conf, 0.40); reason = "image douteuse (vision: produits differents)"
+    # VETO PHOTOS REELLES: si les photos sont clairement artisanales (pas IA/studio) ET qu'aucune
+    # PAGE AliExpress n'est confirmee, on NE confirme PAS sur l'image seule (faux positif typique:
+    # vrai artisan dont Lens a relie une photo a un produit AliExpress sans rapport). Sauf pays usine.
+    if real_photos and page_ok == 0 and country not in c._DROPSHIP_COUNTRIES:
+        conf = min(conf, 0.45); reason = "photos artisan reelles (pas IA/studio) => probablement PAS drop"
+    # le profil remonte un peu une preuve image DEJA solide (jamais ne cree une preuve)
+    if conf >= 0.55 and not real_photos:
+        conf = max(conf, min(float(prof), conf + 0.10))
 
     conf = round(max(0.0, min(1.0, conf)), 2)
     confirmed = conf >= DROP_GATE

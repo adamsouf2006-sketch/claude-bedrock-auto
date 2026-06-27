@@ -205,8 +205,17 @@ class H(BaseHTTPRequestHandler):
                         # creuser plus, au lieu de tout cramer d'un coup. Un max_api explicite reste
                         # respecte (opt-in conscient).
                         import os as _os
-                        cap = int(_os.environ.get("MAX_API_AUTO", "400"))
-                        mxa = gi("max_api", 0) or min(tgt * 6 + 100, cap)
+                        # PLAFOND PROPORTIONNEL A LA CIBLE: un cap fixe (400) arretait le run
+                        # bien avant la cible (target 500 => ~3100 credits requis, capait a 400 =>
+                        # ~100 boutiques puis saut direct a la verif drop). On garde une reserve
+                        # quota (20%) mais on laisse le budget monter avec la cible. Override
+                        # explicite via max_api ou MAX_API_AUTO (cap dur facultatif).
+                        try: _rem = int(core.quota_remaining())
+                        except Exception: _rem = 5000
+                        hard = max(int(_rem * 0.8), 400)
+                        cap_env = int(_os.environ.get("MAX_API_AUTO", "0") or 0)
+                        if cap_env: hard = min(hard, cap_env)
+                        mxa = gi("max_api", 0) or min(tgt * 6 + 100, hard)
                         res = core.run_discovery(keyword=keyword, target_count=tgt,
                                                  max_api=mxa, filters=filters, progress=prog, stop=ev)
                     else:
@@ -236,8 +245,12 @@ class H(BaseHTTPRequestHandler):
                 else:
                     tgt = min(target, 1000)
                     import os as _os
-                    cap = int(_os.environ.get("MAX_API_AUTO", "400"))
-                    mxa = gi("max_api", 0) or min(tgt * 6 + 100, cap)
+                    try: _rem = int(core.quota_remaining())
+                    except Exception: _rem = 5000
+                    hard = max(int(_rem * 0.8), 400)
+                    cap_env = int(_os.environ.get("MAX_API_AUTO", "0") or 0)
+                    if cap_env: hard = min(hard, cap_env)
+                    mxa = gi("max_api", 0) or min(tgt * 6 + 100, hard)
                     res = core.run_discovery(keyword=keyword, target_count=tgt,
                                              max_api=mxa, filters=filters)
                 return self._send(200, json.dumps(res, ensure_ascii=False))
@@ -246,6 +259,65 @@ class H(BaseHTTPRequestHandler):
             finally:
                 if source in ("scrape", "live"):
                     core.close_browsers()      # ferme onglets/pages: recherche finie
+        if u.path == "/api/niche_finder_reset":
+            # oublie les niches deja proposees => autorise a les re-suggerer
+            import niche_finder
+            niche_finder.reset_niche_history()
+            return self._send(200, json.dumps({"reset": True}))
+        if u.path in ("/api/niche_finder", "/api/niche_finder_stream"):
+            # NICHE FINDER: propose des niches a fort potentiel drop + demande (2 phases).
+            q = parse_qs(u.query)
+            def gi3(k, d):
+                try: return int(q.get(k, [d])[0])
+                except: return d
+            def gb3(k):
+                return q.get(k, ["false"])[0].lower() in ("1", "true", "yes", "on")
+            mode = q.get("mode", ["scrape"])[0]
+            filters = {
+                "exclude_digital": True, "exclude_perso": True,
+                "use_ai": True,
+                "only_cn_hk": gb3("only_cn_hk"),
+                "ali_products": gi3("ali_products", 5),
+                "ali_min_match": gi3("ali_min_match", 2),
+            }
+            n_candidates = min(gi3("n_candidates", 15), 30)
+            sample_per_niche = min(gi3("sample_per_niche", 6), 15)
+            deep_top = min(gi3("deep_top", 3), 8)
+            import niche_finder
+            if u.path == "/api/niche_finder_stream":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                def sse3(obj):
+                    try:
+                        self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                sid = q.get("sid", [""])[0]
+                ev = core.make_cancel(sid) if sid else None
+                try:
+                    res = niche_finder.scout_niches(filters=filters, mode=mode,
+                            n_candidates=n_candidates, sample_per_niche=sample_per_niche,
+                            deep_top=deep_top, progress=sse3, stop=ev)
+                    sse3({"type": "done", "result": res})
+                except Exception as e:
+                    sse3({"type": "error", "error": str(e)})
+                finally:
+                    if sid: core.clear_cancel(sid)
+                    core.close_browsers()
+                return
+            try:
+                res = niche_finder.scout_niches(filters=filters, mode=mode,
+                        n_candidates=n_candidates, sample_per_niche=sample_per_niche,
+                        deep_top=deep_top)
+                return self._send(200, json.dumps(res, ensure_ascii=False))
+            except Exception as e:
+                return self._send(500, json.dumps({"error": str(e)}))
+            finally:
+                core.close_browsers()
         return self._send(404, json.dumps({"error": "not found"}))
 
 

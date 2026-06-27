@@ -219,6 +219,12 @@ async def _afetch(url, wait, retries=2, network_idle=True):
     hard = wait / 1000.0 + 8    # secondes: attente JS + marge chargement (reduite)
     p = None
     for attempt in range(retries):
+        # ANTI-429 UNIFIE: respecte une PAUSE GLOBALE posee par un 429 (vu par CE moteur OU par le
+        # moteur CDP). Sans ca, scrapling continuait a marteler Etsy pendant que le CDP refroidissait
+        # => 429 entretenu. _cdp_throttle est partage par les 2 voies.
+        now = time.time()
+        if _cdp_throttle["until"] > now:
+            await asyncio.sleep(_cdp_throttle["until"] - now)
         try:
             s = await _get_session()
             p = await asyncio.wait_for(
@@ -234,6 +240,16 @@ async def _afetch(url, wait, retries=2, network_idle=True):
         if p is not None and getattr(p, "status", 0) == 200:
             await _rotate_tick(ok=True)
             return p
+        # 429 EXPLICITE (rate-limit, pas un simple 403 Datadome): on pose une PAUSE GLOBALE longue
+        # (Retry-After si present) + on reduit la concurrence CDP => les 2 moteurs refroidissent
+        # ensemble. Un 403 reste gere par la rotation d'identite (backoff court ci-dessous).
+        if p is not None and getattr(p, "status", 0) == 429:
+            ra = _retry_after_secs(p)
+            back = max(ra, (8, 20, 45, 90)[min(attempt, 3)])
+            _note_throttle(back)
+            await _rotate_tick(ok=False)
+            await asyncio.sleep(back)
+            continue
         await _rotate_tick(ok=False)               # 403/timeout => peut declencher rotation
         await asyncio.sleep(0.6 + attempt * 0.8)   # backoff croissant
     return p
@@ -492,12 +508,36 @@ def _parse_shop(p):
 # (teste: 1126 boutiques, 0x429), MAIS instable dans le pipeline complet run_scrape (le scrape de
 # catalogues enchaine peut se figer). Defaut OFF => moteur camoufox eprouve. Active avec
 # SCRAPE_VIA_CHROME=1 pour la recherche SEARCH rapide; a affiner avant de le mettre par defaut.
-SCRAPE_VIA_CHROME = os.environ.get("SCRAPE_VIA_CHROME", "0") in ("1", "true", "yes")
-CDP_CONC = int(os.environ.get("SCRAPE_CDP_CONC", "4"))   # onglets paralleles (bas => moins de 429)
-CDP_GAP = float(os.environ.get("SCRAPE_CDP_GAP", "0.35")) # pause mini entre ouvertures d'onglet
-CDP_RETRIES = int(os.environ.get("SCRAPE_CDP_RETRIES", "3"))
+# MODE CDP: "auto" (defaut) = on utilise le vrai Chrome debug DES QU'IL EST JOIGNABLE (seul moyen
+# de battre Datadome sans proxy => fini les 403 sur les pages boutique). "1"/"on" = force on ;
+# "0"/"off" = force le moteur camoufox (scrapling). L'ancien defaut "0" laissait le scrape se faire
+# en scrapling => Datadome 403 silencieux sur les catalogues. Auto resout le "scraping bloque".
+_SCRAPE_VIA_CHROME_ENV = os.environ.get("SCRAPE_VIA_CHROME", "auto").strip().lower()
+SCRAPE_VIA_CHROME = _SCRAPE_VIA_CHROME_ENV in ("1", "true", "yes", "on")  # compat (force on explicite)
+
+def _use_cdp():
+    """Faut-il scraper via le vrai Chrome (CDP) ? Force on/off via SCRAPE_VIA_CHROME, sinon AUTO:
+    on des que le Chrome debug est joignable (_cdp_available). C'est la parade Datadome (les pages
+    boutique en scrapling renvoient 403). Si le CDP n'est pas la => False => repli scrapling (jamais
+    bloque a 0)."""
+    if _SCRAPE_VIA_CHROME_ENV in ("1", "true", "yes", "on"):
+        return True
+    if _SCRAPE_VIA_CHROME_ENV in ("0", "false", "no", "off"):
+        return False
+    return _cdp_available()
+# ANTI-429 (Etsy/Datadome rate-limit sur scrape soutenu): le 429 vient du DEBIT trop eleve sur la
+# duree (beaucoup d'onglets en parallele + peu de pause). Sur un run long (multi-niches), ca
+# s'accumule => pages vides => sampling=0. Defauts CONSERVATEURS: peu de parallelisme, gros espacement,
+# backoff long. Reglables via env si on veut pousser le debit (au risque de + de 429).
+CDP_CONC = int(os.environ.get("SCRAPE_CDP_CONC", "2"))    # onglets paralleles (2 = bcp moins de 429)
+CDP_GAP = float(os.environ.get("SCRAPE_CDP_GAP", "0.8"))  # pause mini entre ouvertures d'onglet
+CDP_RETRIES = int(os.environ.get("SCRAPE_CDP_RETRIES", "4"))
+# Pause de base entre CHAQUE requete (lissage du debit) + jitter aleatoire => moins "robotique"
+# pour Datadome. Reglable via SCRAPE_CDP_PACE.
+CDP_PACE = float(os.environ.get("SCRAPE_CDP_PACE", "0.6"))
 _cdp = {"pw": None, "br": None, "ctx": None}
-_cdp_throttle = {"until": 0.0}   # quand Etsy 429 => on met TOUT le scrape en pause jusqu'a ce ts
+_cdp_throttle = {"until": 0.0, "conc": int(os.environ.get("SCRAPE_CDP_CONC", "2")),
+                 "cool_until": 0.0}   # 429 => pause globale (until) + concurrence reduite (cool_until)
 
 class _CDPPage:
     """Adapte le HTML recupere via CDP a l'interface attendue par _parse_search/_parse_shop
@@ -512,8 +552,18 @@ class _CDPPage:
 
 async def _cdp_get_ctx():
     from patchright.async_api import async_playwright
+    # SANTE: un contexte CACHE peut etre ZOMBIE (Chrome ferme/relance, navigateurs tues entre 2
+    # runs) => toutes les navigations echouent en "frame detached" et on ne reconnecte jamais
+    # (cause du sampling=0 + fallback scrapling 403). On verifie que le navigateur est ENCORE
+    # connecte; sinon on reset et on rouvre une connexion CDP propre.
     if _cdp["ctx"] is not None:
-        return _cdp["ctx"]
+        br = _cdp.get("br")
+        try:
+            if br is not None and br.is_connected():
+                return _cdp["ctx"]
+        except Exception:
+            pass
+        await _cdp_close()                      # zombie => on repart sur une connexion neuve
     import ali_chrome
     url = await asyncio.to_thread(ali_chrome.ensure_chrome)
     cdp_url = url if (url or "").startswith("http") else "http://localhost:9222"
@@ -541,15 +591,58 @@ def _is_throttled_html(status, html):
         return True
     return False
 
+# Cap dur du Retry-After: un serveur (ou un Datadome capricieux) peut renvoyer une valeur enorme
+# (ex 999999s) qui GELERAIT tout le scrape. On respecte la demande mais bornee a CDP_RA_MAX.
+CDP_RA_MAX = float(os.environ.get("SCRAPE_RA_MAX", "120"))
+
+def _retry_after_secs(resp):
+    """Lit l'en-tete Retry-After d'une reponse (429/503). Etsy/Datadome l'envoient parfois =>
+    on respecte la duree demandee (parade 429 la plus fiable), BORNEE a CDP_RA_MAX (anti-gel).
+    Retourne secondes (0..CDP_RA_MAX) ou 0."""
+    try:
+        h = resp.headers if resp is not None else {}
+        ra = h.get("retry-after") or h.get("Retry-After")
+        if not ra:
+            return 0.0
+        ra = str(ra).strip()
+        if ra.isdigit():
+            return min(float(ra), CDP_RA_MAX)
+        # format date HTTP
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(ra)
+        if dt is not None:
+            return min(max(0.0, dt.timestamp() - time.time()), CDP_RA_MAX)
+    except Exception:
+        pass
+    return 0.0
+
+def _note_throttle(secs):
+    """Pose une pause GLOBALE >= secs ET reduit la concurrence effective a 1 (toutes les pages
+    attendent + on arrete d'ouvrir des onglets en parallele tant que ca refroidit)."""
+    _cdp_throttle["until"] = max(_cdp_throttle["until"], time.time() + secs)
+    _cdp_throttle["conc"] = 1
+    _cdp_throttle["cool_until"] = max(_cdp_throttle.get("cool_until", 0.0), time.time() + secs + 30)
+
+def _eff_conc():
+    """Concurrence effective: 1 pendant la fenetre de refroidissement post-429, sinon CDP_CONC."""
+    if _cdp_throttle.get("cool_until", 0.0) > time.time():
+        return 1
+    _cdp_throttle["conc"] = max(1, CDP_CONC)
+    return _cdp_throttle["conc"]
+
 async def _cdp_fetch_one(ctx, url, wait):
     """Ouvre 1 onglet, charge l'URL, rend le HTML (str) ou None. Gere le 429/403 d'Etsy:
-    backoff exponentiel + PAUSE GLOBALE (tous les onglets attendent) pour ne pas aggraver le
-    rate-limit. Respecte une pause globale en cours avant de partir."""
+    Retry-After respecte si present, sinon backoff exponentiel + PAUSE GLOBALE (tous les onglets
+    attendent) pour ne pas aggraver le rate-limit. Respecte une pause globale en cours avant de partir."""
+    import random as _rnd
     for attempt in range(max(1, CDP_RETRIES)):
         # respecte une pause globale posee par un 429 precedent
         now = time.time()
         if _cdp_throttle["until"] > now:
             await asyncio.sleep(_cdp_throttle["until"] - now)
+        # PACING: petite pause de base + jitter avant chaque requete => debit lisse, moins de 429.
+        if CDP_PACE > 0:
+            await asyncio.sleep(CDP_PACE * (0.5 + _rnd.random()))
         pg = None
         try:
             pg = await ctx.new_page()
@@ -559,16 +652,19 @@ async def _cdp_fetch_one(ctx, url, wait):
                 await pg.wait_for_timeout(int(wait))
             html = await pg.content()
             if _is_throttled_html(status, html):
-                # 429/Datadome: pause GLOBALE croissante (3s, 8s, 18s) => laisse l'IP refroidir.
-                back = (3, 8, 18)[min(attempt, 2)]
-                _cdp_throttle["until"] = max(_cdp_throttle["until"], time.time() + back)
+                # Retry-After prioritaire (valeur EXACTE demandee par le serveur), sinon backoff
+                # GLOBAL croissant 8/20/45/90s => laisse l'IP refroidir VRAIMENT sur un run long.
+                ra = _retry_after_secs(resp)
+                base = (8, 20, 45, 90)[min(attempt, 3)] * (0.8 + 0.4 * _rnd.random())
+                back = max(ra, base)
+                _note_throttle(back)                  # pause globale + concurrence -> 1
                 try: await pg.close()
                 except Exception: pass
                 await asyncio.sleep(back)
                 continue
             return html
         except Exception:
-            await asyncio.sleep(1.0 + attempt)
+            await asyncio.sleep(1.5 + attempt * 1.5)
         finally:
             if pg is not None:
                 try: await pg.close()
@@ -576,13 +672,14 @@ async def _cdp_fetch_one(ctx, url, wait):
     return None
 
 async def _cdp_fetch_many(urls, wait):
-    """Charge les URLs par onglets, borne par CDP_CONC + STAGGER (CDP_GAP) entre ouvertures pour
-    lisser le debit (anti-429). [(url, html|None)]."""
+    """Charge les URLs par onglets, borne par la concurrence EFFECTIVE (1 en refroidissement
+    post-429, sinon CDP_CONC) + STAGGER (CDP_GAP) entre ouvertures pour lisser le debit (anti-429)."""
     ctx = await _cdp_get_ctx()
-    sem = asyncio.Semaphore(max(1, CDP_CONC))
+    conc = _eff_conc()
+    sem = asyncio.Semaphore(max(1, conc))
     async def one(i, u):
         async with sem:
-            await asyncio.sleep(CDP_GAP * (i % max(1, CDP_CONC)))   # decale les departs
+            await asyncio.sleep(CDP_GAP * (i % max(1, _eff_conc())))   # decale les departs
             return u, await _cdp_fetch_one(ctx, u, wait)
     return await asyncio.gather(*[one(i, u) for i, u in enumerate(urls)])
 
@@ -670,7 +767,7 @@ def etsy_login_window():
 def etsy_session_ok():
     """True si le Chrome debug atteint Etsy SANS blocage Datadome (session connectee valide).
     Sert a dire a l'utilisateur si son login a marche avant de lancer un gros scrape."""
-    if not SCRAPE_VIA_CHROME:
+    if not _use_cdp():
         return None
     try:
         m = _cdp_pages(["https://www.etsy.com/search?q=test&ref=search"], SEARCH_WAIT)
@@ -713,7 +810,7 @@ def _shops_batch_cdp(names):
 # ---- API sync ----------------------------------------------------------------
 def scrape_search_shops(keyword, pages=1, page_start=1):
     """Pages de recherche -> [(shop_name, sample_title)]. 0 API."""
-    if SCRAPE_VIA_CHROME and _cdp_available():
+    if _use_cdp():
         r = _search_shops_cdp(keyword, pages, page_start)
         if r or not SCRAPLING_OK:
             return r
@@ -759,11 +856,23 @@ def scrape_shops_batch(names, wait=SHOP_WAIT):
     (404, boutique absente) ne sont PAS re-essayees (pas un crash)."""
     if not names:
         return {}
-    if SCRAPE_VIA_CHROME and _cdp_available():
+    if _use_cdp():
         r = _shops_batch_cdp(names)
-        if not SCRAPLING_OK or any((v or {}).get("sold") is not None for v in r.values()):
+        if any((v or {}).get("sold") is not None for v in r.values()):
             return r
-        # CDP n'a rien rendu => fallback scrapling (jamais bloque)
+        # CDP a tout rate (souvent un contexte ZOMBIE apres redemarrage/kill du Chrome): on RESET
+        # la connexion CDP et on RETENTE une fois sur une session neuve.
+        try: _run(_cdp_close())
+        except Exception: pass
+        r2 = _shops_batch_cdp(names)
+        if any((v or {}).get("sold") is not None for v in r2.values()):
+            return r2
+        # CDP toujours vide: on NE retombe PAS sur scrapling pour les pages BOUTIQUE. Les pages
+        # /shop/ en scrapling renvoient 403 Datadome quasi systematiquement ET chaque tentative
+        # coute ~3 min de retries => 403-storm qui faisait durer un run >1h pour 0 resultat.
+        # On rend le verdict CDP (erreurs explicites) => le pipeline continue vite. La recherche
+        # SEARCH, elle, garde son fallback scrapling (200 OK) plus bas.
+        return r2 if any(r2.values()) else r
     if not SCRAPLING_OK:
         return {}
     async def fetch_set(targets):
@@ -829,12 +938,31 @@ _ali_warm = {"done": False}
 def scrape_ali_search(query):
     """Recherche texte AliExpress via la session scrapling (camoufox furtif).
     Rechauffe la session (visite accueil) pour limiter le captcha x5sec.
-    Retourne ([titres], blocked: bool). blocked=True si AliExpress nous captcha."""
+    Retourne ([{title, img}], blocked: bool). blocked=True si AliExpress nous captcha.
+
+    On capture aussi l'IMAGE produit de chaque carte (vignette): elle permet une
+    confirmation VISUELLE 'meme objet' (juge vision) en aval => preuve drop quasi-certaine
+    meme quand la recherche par image inversee (Lens) est bloquee."""
     if not SCRAPLING_OK:
         return [], False
     import re as _re, urllib.parse as _up
     slug = _re.sub(r"[^a-z0-9]+", "-", (query or "").lower()).strip("-") or "gift"
     url = "https://www.aliexpress.com/w/wholesale-" + slug + ".html?SearchText=" + _up.quote(query or "")
+    def _img_of(node):
+        """src de la 1re <img> de la carte (gere le lazy-load: data-src/srcset). '' si aucune."""
+        for im in node.css("img"):
+            at = im.attrib or {}
+            for k in ("src", "data-src", "data-lazy-src", "ali-src"):
+                u = at.get(k) or ""
+                if u.startswith("//"): u = "https:" + u
+                if u.startswith("http") and "/kf/" in u or (u.startswith("http") and u.endswith((".jpg", ".jpeg", ".png", ".webp"))):
+                    return u
+            ss = at.get("srcset") or ""
+            if ss:
+                u = ss.split(",")[0].strip().split(" ")[0]
+                if u.startswith("//"): u = "https:" + u
+                if u.startswith("http"): return u
+        return ""
     async def go():
         if not _ali_warm["done"]:
             try: await _afetch("https://www.aliexpress.com", 4000, retries=1)
@@ -846,12 +974,25 @@ def scrape_ali_search(query):
         blocked = ("punish" in (getattr(p, "url", "") or "")) or ("_____tmd_____" in (getattr(p, "url", "") or ""))
         if blocked:
             return [], True
-        titles = []
+        items, seen = [], set()
+        # carte = <a/item/> qui CONTIENT l'<img> produit. Le TITRE n'est PAS dans a.text (vide):
+        # AliExpress le met dans l'attribut alt de l'image. On lit donc title=alt et img=src de la
+        # MEME image => titre et vignette toujours du meme produit.
         for a in p.css('a[href*="/item/"]'):
+            imgs = a.css("img")
             t = " ".join((a.text or "").split())
-            if t and len(t) > 12 and t not in titles:
-                titles.append(t)
-        return titles[:10], False
+            img = ""
+            if imgs:
+                at = imgs[0].attrib or {}
+                if not t:
+                    t = " ".join((at.get("alt") or "").split())
+                img = _img_of(a)
+            if not (t and len(t) > 12) or t in seen:
+                continue
+            seen.add(t); items.append({"title": t, "img": img})
+            if len(items) >= 10:
+                break
+        return items, False
     try:
         return _run(go())
     except Exception:

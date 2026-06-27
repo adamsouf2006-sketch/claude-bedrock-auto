@@ -12,7 +12,7 @@ Idee cle: l'endpoint listings/active renvoie deja, par produit (0 appel boutique
 Resultat : 1 appel listings = 100 produits filtres ; enrichissement cible
 => beaucoup plus de bonnes boutiques pour bien moins de credits.
 """
-import urllib.request, urllib.parse, urllib.error, json, time, os, threading
+import urllib.request, urllib.parse, urllib.error, json, time, os, threading, re
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -258,6 +258,22 @@ def _vision_batch_score(image_urls):
     except Exception:
         return None
 
+def _hires(url):
+    """ZOOM: remonte une URL image Etsy/AliExpress a sa plus haute resolution pour que l'IA
+    voie les DETAILS (motif, gravure, texture) au lieu d'une vignette floue.
+    - Etsy: i.etsystatic.com/.../il_300x300.xxx -> il_fullxfull.xxx
+    - AliExpress: .../xxx_220x220.jpg -> .../xxx.jpg (retire le suffixe de taille)"""
+    if not url:
+        return url
+    u = url
+    try:
+        u = re.sub(r"il_\d+x[\dN]+\.", "il_fullxfull.", u)              # Etsy
+        u = re.sub(r"_\d{2,4}x\d{2,4}(xz|xs|q\d+)?\.(jpg|jpeg|png|webp)", r".\2", u)  # AliExpress / CDN
+        u = re.sub(r"\.(jpg|jpeg|png|webp)_\d+x\d+.*$", r".\1", u)      # ali _220x220q75.jpg_.webp
+    except Exception:
+        return url
+    return u
+
 def _vision_same_product(etsy_img, ali_img):
     """Compare DEUX images (photo produit Etsy vs vignette AliExpress remontee par Lens) et juge
     si c'est le MEME produit exact, en regardant les DETAILS (forme, proportions, anse/poignee,
@@ -268,17 +284,21 @@ def _vision_same_product(etsy_img, ali_img):
     if not etsy_img or not ali_img or not vision_available():
         return None
     prompt = (
-        "Image 1 = photo produit d'une boutique Etsy. Image 2 = vignette d'un produit AliExpress "
-        "trouve par recherche d'image inversee. Question: est-ce EXACTEMENT le MEME produit "
-        "(meme article, pas juste 'du meme genre') ?\n"
-        "Compare les DETAILS: forme et proportions exactes, anse/poignee, decoupe, motif, "
-        "gravure/texte, couleur, texture/materiau, accessoires inclus, nombre de pieces. "
-        "IGNORE le fond, la lumiere, l'angle, le recadrage, le watermark.\n"
-        "Sois STRICT: au moindre detail qui differe (forme, motif, proportions), reponds false. "
-        "Mieux vaut rejeter un match douteux que confirmer un faux positif.\n"
-        "Renvoie UNIQUEMENT ce JSON: {\"same\":true|false,\"confidence\":0.0,\"why\":\"<5 mots>\"}"
+        "Image 1 = photo produit d'une boutique Etsy. Image 2 = produit AliExpress trouve par "
+        "recherche d'image inversee. Question: est-ce le MEME produit physique (meme article "
+        "fabrique au meme endroit), pas juste 'du meme genre' ?\n"
+        "REGLE: c'est le MEME produit meme si la PHOTO differe (autre angle, autre fond, autre "
+        "lumiere, autre mise en scene, watermark) DU MOMENT QUE l'OBJET est identique. Compare "
+        "l'OBJET, pas la photo: forme et proportions, anse/poignee/bec, decoupe, MOTIF et "
+        "disposition du motif, gravure/texte, COULEURS exactes, texture/materiau, finition, "
+        "TAILLE relative et nombre de pieces/accessoires inclus.\n"
+        "true  = meme objet (memes couleurs, meme motif, memes proportions) meme si la photo change.\n"
+        "false = un detail de l'OBJET differe (motif, forme, couleur, proportions) = produits differents.\n"
+        "Au moindre doute sur l'OBJET (pas sur la photo), reponds false: mieux vaut rater une "
+        "preuve que confirmer un faux positif.\n"
+        "Renvoie UNIQUEMENT ce JSON: {\"same\":true|false,\"confidence\":0.0,\"why\":\"<6 mots>\"}"
     )
-    txt = _ai_vision_call(prompt, [etsy_img, ali_img], max_tokens=200)
+    txt = _ai_vision_call(prompt, [_hires(etsy_img), _hires(ali_img)], max_tokens=200)
     if not txt:
         return None
     try:
@@ -286,7 +306,7 @@ def _vision_same_product(etsy_img, ali_img):
         d = json.loads(txt)
         same = d.get("same")
         conf = float(d.get("confidence") or 0)
-        if same is True and conf >= 0.6:
+        if same is True and conf >= 0.7:   # seuil haut: au moindre doute => pas "same" (anti faux positif)
             return True
         if same is False:
             return False
@@ -373,8 +393,13 @@ def _ai_refine_chunk(chunk, query=""):
             "'wall storage' qui n'est pas explicitement pour la CUISINE NE compte PAS.\n"
             "Le champ 'niche' que tu renvoies DOIT etre coherent avec la categorie cherchee quand "
             "match=true (ex doit parler de cuisine/rangement cuisine, pas de 'rangement mural laiton').\n"
+            "- share (float 0..1) [OBLIGATOIRE]: FRACTION des titres qui appartiennent VRAIMENT a la "
+            "categorie cherchee (ex cuisine). Compte les titres en-categorie / total. Une boutique qui "
+            "vend QUELQUES produits cuisine parmi d'autres aura par ex share=0.3 (et match=false car "
+            "<60%). share=0 si AUCUN produit de la categorie. Sois precis: c'est ce qui permet de "
+            "tolerer un dropshipper a catalogue mixte qui vend AUSSI de la cuisine.\n"
         )
-        rel_field = "\"match\":true,"
+        rel_field = "\"match\":true,\"share\":0.5,"
     prompt = (
         "Tu es un AGENT autonome d'analyse de niches Etsy pour un dropshipper. Tu recois "
         "plusieurs boutiques, chacune avec la LISTE complete de ses titres produits.\n\n"
@@ -470,7 +495,7 @@ def _ai_sig(query, shop):
     titles = (shop.get("titles") or [shop.get("sample", "")])[:40]
     # PROMPT_VER: a incrementer quand on change le prompt/les regles de jugement => invalide les
     # vieux verdicts en cache (sinon une boutique re-affichee garde l'ancienne decision laxiste).
-    base = "v3|" + (query or "").lower() + "|" + "|".join(sorted(t.lower() for t in titles if t))
+    base = "v4|" + (query or "").lower() + "|" + "|".join(sorted(t.lower() for t in titles if t))
     return hashlib.md5(base.encode("utf-8", "replace")).hexdigest()
 
 def _ai_cache_path():
@@ -956,7 +981,20 @@ def ai_enrich_shops(shops, f, stop=None):
     # "couverture" (avant: si l'IA ratait >50% des boutiques, on relachait tout => fuite de vases /
     # porte-lunettes / robinets sous 'kitchen organizer'). ai_refine retente les boutiques non
     # jugees, donc un no-verdict residuel = vraie incertitude => on prefere jeter (qualite > quantite).
-    strict = bool(query) and not clone_mode and not keep_mixed
+    # CHASSE AU DROP: quand on valide par image (validate_ali) AVEC gate drop, la PREUVE IMAGE
+    # est le vrai filtre final. Le gate niche STRICT de l'IA (match=true exige) tuait alors les
+    # dropshippers a catalogue HETEROCLITE (cuisine + divers) AVANT meme de tester la photo =>
+    # 388 scrapees -> 1 en-niche. En mode chasse-drop on NE JETTE PLUS sur l'incertitude niche:
+    # une boutique sans verdict OU non match=true est GARDEE pour le test image (la preuve drop
+    # + ali_gate trient ensuite). On ne jette QUE le rejet IA explicite (accept=false = hors-sujet net).
+    hunt = bool(f.get("validate_ali"))
+    # TOLERANCE CATALOGUE MIXTE (regle utilisateur): en chasse-drop on garde une boutique qui vend
+    # AU MOINS quelques produits de la niche (share >= SHARE_MIN), meme si ce n'est pas la majorite
+    # (match=false). Un dropshipper a souvent un catalogue mixte cuisine + divers. On NE garde PAS
+    # les boutiques SANS aucun lien (share ~0 = que des tapis/vases). La preuve image + ali_gate
+    # trient ensuite. SHARE_MIN reglable via env NICHE_SHARE_MIN (defaut 0.15 = au moins ~15%).
+    share_min = float(os.environ.get("NICHE_SHARE_MIN", "0.15"))
+    strict = bool(query) and not clone_mode and not keep_mixed and not hunt
     _ = coverage   # garde le calcul (diagnostic) sans l'utiliser comme assouplissement
     kept = []
     # 1er passage: applique verdict + collecte les libelles libres par cle de regroupement
@@ -973,7 +1011,15 @@ def ai_enrich_shops(shops, f, stop=None):
         if not v.get("accept", True):
             continue                            # IA rejette: hors cible
         if query and v.get("match") is not True and not clone_mode and not keep_mixed:
-            continue                            # match doit etre EXPLICITEMENT true (strict)
+            if not hunt:
+                continue                        # match doit etre EXPLICITEMENT true (strict)
+            # CHASSE-DROP: pas la majorite, mais on tolere si la boutique vend QUELQUES produits
+            # de la niche (catalogue mixte). On jette seulement si AUCUN lien (share < seuil).
+            sh = v.get("share")
+            try: sh = float(sh) if sh is not None else None
+            except Exception: sh = None
+            if sh is not None and sh < share_min:
+                continue                        # ~0 produit de la niche => vrai hors-sujet
         raw = (str(v.get("niche") or "")).strip() or "Divers"
         key = niche_canon(raw) or raw.lower()
         canon_labels.setdefault(key, Counter())[raw] += 1
@@ -1027,7 +1073,54 @@ CACHE = Path(__file__).parent / "cache"; CACHE.mkdir(exist_ok=True)
 SHOP_CACHE = CACHE / "shops.json"
 CURSOR = CACHE / "cursor.json"   # rotation paging discovery (evite memes niches a chaque run)
 QUOTA_F = CACHE / "quota.json"   # dernier quota Etsy connu (persiste entre runs)
+SHOWN_F = CACHE / "shown.json"   # boutiques DEJA RENDUES a l'utilisateur (jamais re-affichees)
 NOW = lambda: datetime.now(timezone.utc)
+
+# ---------------- registre "deja donne" (anti-doublon entre runs) ----------------
+# Toute boutique deja RENDUE dans un resultat (api OU scrape) est memorisee ici par nom
+# (minuscule) ET par id. Aux runs suivants on la SAUTE avant tout enrichissement => zero
+# credit/ressource gaspille a re-traiter une boutique deja vue, et l'utilisateur ne revoit
+# jamais 2x la meme. Vidable en supprimant cache/shown.json (ou via reset_shown()).
+def _shown_load():
+    try:
+        d = json.loads(SHOWN_F.read_text(encoding="utf-8"))
+        return set(d.get("keys") or [])
+    except Exception:
+        return set()
+
+def _shown_keys(rec):
+    """Cles d'identite d'une boutique: nom minuscule + id (str). Tolerant au mode."""
+    out = []
+    nm = (rec.get("name") or "").strip().lower()
+    if nm: out.append("n:" + nm)
+    rid = str(rec.get("id") or "").strip().lower()
+    if rid and rid != "none": out.append("i:" + rid)
+    return out
+
+def is_shown(rec, shown=None):
+    s = shown if shown is not None else _shown_load()
+    return any(k in s for k in _shown_keys(rec))
+
+def _shown_add(recs):
+    """Ajoute des boutiques au registre 'deja donne' (apres affichage). Atomique."""
+    s = _shown_load()
+    before = len(s)
+    for rec in recs or []:
+        for k in _shown_keys(rec):
+            s.add(k)
+    if len(s) == before:
+        return
+    tmp = SHOWN_F.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps({"keys": sorted(s)}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(SHOWN_F)
+    except Exception:
+        pass
+
+def reset_shown():
+    """Oublie toutes les boutiques deja rendues (autorise a les re-proposer)."""
+    try: SHOWN_F.unlink()
+    except Exception: pass
 def _today_utc():
     return NOW().strftime("%Y-%m-%d")
 def _quota_load():
@@ -1058,14 +1151,26 @@ def _update_quota(rem, lim):
         _persist_quota()
 
 # ---------------- cache ----------------
+# MEMO base boutiques (perf, req 1): la base (shops.json, ~7000 records) etait RE-PARSEE a chaque
+# requete cache (~7s sur un gros fichier). On memorise le dict parse, clos par (mtime, taille) du
+# fichier: on ne re-parse QUE si le fichier a change (apres un scrape/_save). Les recherches
+# repetees deviennent instantanees. Invalidation automatique des qu'un autre process ecrit le fichier.
+_load_memo = {"key": None, "data": None}
+
 def _load():
     # ROBUSTE: un cache vide/tronque (ex: process tue pendant _save) ne doit PAS crasher
     # tout l'app. On renvoie {} et on met le fichier corrompu de cote (.bad) pour debug.
     if not SHOP_CACHE.exists():
         return {}
     try:
+        st = SHOP_CACHE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if _load_memo["key"] == key and _load_memo["data"] is not None:
+            return dict(_load_memo["data"])        # fichier inchange => 0 re-parse (copie = isolation thread)
         txt = SHOP_CACHE.read_text(encoding="utf-8-sig")
-        return json.loads(txt) if txt.strip() else {}
+        data = json.loads(txt) if txt.strip() else {}
+        _load_memo.update(key=key, data=data)
+        return dict(data)                          # copie superficielle: itere sans risque si un scrape ecrit
     except (ValueError, OSError):
         try: SHOP_CACHE.replace(SHOP_CACHE.with_suffix(SHOP_CACHE.suffix + ".bad"))
         except Exception: pass
@@ -1076,6 +1181,11 @@ def _save(d):
     tmp = SHOP_CACHE.with_suffix(SHOP_CACHE.suffix + ".tmp")
     tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
     tmp.replace(SHOP_CACHE)
+    try:                                            # rafraichit le memo => prochain _load instantane
+        st = SHOP_CACHE.stat()
+        _load_memo.update(key=(st.st_mtime_ns, st.st_size), data=dict(d))
+    except Exception:
+        _load_memo.update(key=None, data=None)      # en cas de doute, force un re-parse au prochain load
 
 def _name_index(cache):
     """nom_minuscule -> cle. Sert a dedupliquer entre modes (api/scrape) ou
@@ -1401,22 +1511,30 @@ DIGITAL_TITLE_KW = [
 def shop_titles(r):
     return r.get("titles") or ([r["sample"]] if r.get("sample") else [])
 
-def perso_ratio(titles):
-    if not titles: return 0.0
-    n = sum(1 for t in titles if any(k in t.lower() for k in PERSO_TITLE_KW))
+# PERF (req 1): le test d'appartenance par substring C-level `any(k in tl for k in KW)` reste le
+# plus rapide ici (une regex alternation IGNORECASE de ~50 litteraux mesuree ~3x PLUS LENTE: l'engine
+# `re` ne fait pas d'Aho-Corasick). On garde le substring, mais on lowercase chaque titre UNE seule
+# fois par ratio (au lieu d'un t.lower() recalcule a chaque mot-cle dans le any()).
+def _ratio(titles, kws):
+    if not titles or not kws:
+        return 0.0
+    n = 0
+    for t in titles:
+        tl = (t or "").lower()
+        if any(k in tl for k in kws):
+            n += 1
     return n / len(titles)
+
+def perso_ratio(titles):
+    return _ratio(titles, PERSO_TITLE_KW)
 
 def digital_ratio(titles):
     """Part du catalogue qui ressemble a un produit digital/fichier/patron."""
-    if not titles: return 0.0
-    n = sum(1 for t in titles if any(k in t.lower() for k in DIGITAL_TITLE_KW))
-    return n / len(titles)
+    return _ratio(titles, DIGITAL_TITLE_KW)
 
 def cat_ratio(titles, kws):
     """Part des titres contenant un mot-cle de la categorie."""
-    if not titles: return 0.0
-    n = sum(1 for t in titles if any(k in t.lower() for k in kws))
-    return n / len(titles)
+    return _ratio(titles, kws)
 
 # Seuils PROPORTION (lucidite): on rejette une boutique seulement si la categorie
 # DOMINE le catalogue, pas sur 1 titre isole. Avant: 1 mot-cle dans 100 titres tuait
@@ -1426,20 +1544,42 @@ DIGITAL_REJECT = 0.55    # >55% digital
 CAT_REJECT = 0.50        # >50% d'une categorie bannie (bijoux, vetements...)
 HEAVY_REJECT = 0.50
 
+def _ratio_ge(titles, kws, thresh):
+    """PERF: vrai SSI part(titres contenant un mot de kws) >= thresh, avec early-exit
+    bidirectionnel (atteint le seuil => stop ; ne PEUT plus l'atteindre => stop). Evite de scanner
+    tout le catalogue d'une boutique clairement non-concernee (cas dominant). Semantique == _ratio>=thresh.
+    Note: comparaison float identique a `(n/len) >= thresh` (on multiplie au lieu de diviser)."""
+    if not titles or not kws:
+        return False
+    tot = len(titles)
+    n = 0
+    # IMPORTANT: on compare avec la MEME forme (division) que _ratio (`n/tot >= thresh`) pour un
+    # resultat float STRICTEMENT identique (zero flip de decision vs l'ancien code).
+    for i, t in enumerate(titles):
+        tl = (t or "").lower()
+        if any(k in tl for k in kws):
+            n += 1
+            if n / tot >= thresh:                # seuil atteint => stop
+                return True
+        # meme avec tous les titres restants comptes, impossible d'atteindre le seuil => stop
+        if (n + (tot - i - 1)) / tot < thresh:
+            return False
+    return n / tot >= thresh
+
 def catalog_reject(titles, f):
     """Decision niveau BOUTIQUE, basee sur la PROPORTION du catalogue (intelligent).
     Retourne (reject: bool, raison). Une boutique n'est rejetee que si la mauvaise
     categorie domine reellement son catalogue."""
     if not titles:
         return False, ""
-    if f.get("exclude_perso", True) and perso_ratio(titles) >= PERSO_REJECT:
+    if f.get("exclude_perso", True) and _ratio_ge(titles, PERSO_TITLE_KW, PERSO_REJECT):
         return True, "perso"
-    if digital_ratio(titles) >= DIGITAL_REJECT:
+    if _ratio_ge(titles, DIGITAL_TITLE_KW, DIGITAL_REJECT):
         return True, "digital"
-    if f.get("exclude_heavy", True) and cat_ratio(titles, HEAVY_KW) >= HEAVY_REJECT:
+    if f.get("exclude_heavy", True) and _ratio_ge(titles, HEAVY_KW, HEAVY_REJECT):
         return True, "lourd"
     for cat in f.get("exclude_categories", []):
-        if cat_ratio(titles, BAN_KW.get(cat, [])) >= CAT_REJECT:
+        if _ratio_ge(titles, BAN_KW.get(cat, []), CAT_REJECT):
             return True, cat
     return False, ""
 
@@ -1581,6 +1721,15 @@ def finalize(res, target=0, min_per_niche=1, diversify=True):
 
     Si min_per_niche<=1: round-robin entre niches puis coupe a EXACTEMENT target."""
     shops = res.get("shops", [])
+    # ANTI-DOUBLON ENTRE RUNS: on retire les boutiques DEJA RENDUES dans un run precedent
+    # (api ou scrape). L'utilisateur ne revoit jamais 2x la meme. Desactivable par run via
+    # res["allow_repeat"] (ex: recherche cache volontaire). reset_shown() pour tout re-autoriser.
+    if not res.get("allow_repeat"):
+        _shown = _shown_load()
+        if _shown:
+            kept = [s for s in shops if not is_shown(s, _shown)]
+            res["hidden_already_shown"] = len(shops) - len(kept)
+            shops = kept
     _ensure_labels(shops)
     try: n = max(1, int(min_per_niche or 1))
     except Exception: n = 1
@@ -1639,6 +1788,9 @@ def finalize(res, target=0, min_per_niche=1, diversify=True):
     res["shops"] = shops
     res["matched"] = len(shops)
     res["clusters"] = cluster(shops)
+    # MEMORISE les boutiques RENDUES => jamais re-affichees au prochain run.
+    if not res.get("allow_repeat"):
+        _shown_add(shops)
     return res
 
 # compat: ancien nom
@@ -1655,6 +1807,10 @@ def search_cache(filters=None, keyword=""):
     f["_query"] = kw_en          # pertinence IA (jugement semantique vs la recherche)
     # seuil de pertinence: au moins 50% des mots-cles forts presents dans le catalogue
     rel_min = float(f.get("relevance_min", 0.35)) if kw_en else 0.0
+    # CATEGORIE (ex "kitchen"): le filtre litteral jette les vraies boutiques cuisine. Si l'IA
+    # juge la niche, on relache la coupe litterale (l'IA tranche sur le catalogue complet).
+    if f.get("use_ai") and ai_available():
+        rel_min = 0.0
     cache = _load()
     shops = []
     for rec in cache.values():
@@ -1669,16 +1825,18 @@ def search_cache(filters=None, keyword=""):
         rej, _ = catalog_reject(titles, f)
         if rej:
             continue
-        # filtres boutique
-        if rec["rate"] < f.get("min_rate", 0): continue
-        if rec["months"] > f.get("max_age_months", 999): continue
-        if rec["months"] < f.get("min_age_months", 0): continue
-        if rec["sold"] < f.get("min_sold", 0): continue
+        # filtres boutique (.get defensif: un enregistrement cache incomplet ne doit pas
+        # crasher tout le filtrage par KeyError => valeurs neutres par defaut)
+        if (rec.get("rate") or 0) < f.get("min_rate", 0): continue
+        _months = rec.get("months")
+        if _months is not None and _months > f.get("max_age_months", 999): continue
+        if (_months or 0) < f.get("min_age_months", 0): continue
+        if (rec.get("sold") or 0) < f.get("min_sold", 0): continue
         if f.get("exclude_digital", True) and rec.get("digital_pct", 0) >= 50: continue
         if kw_en:                          # affiche un produit qui matche le mot-cle
             rec = dict(rec); rec["sample"] = match_sample(titles, kw_en)
         shops.append(rec)
-    shops.sort(key=lambda x: -x["rate"])   # best-sellers d'abord (ventes/mois)
+    shops.sort(key=lambda x: -(x.get("rate") or 0))   # best-sellers d'abord (ventes/mois)
     total = len(shops)
     # IA (GLM gratuit): juge/repartit sur un POOL limite (les meilleurs candidats) pour
     # ne pas exploser le nombre d'appels. Puis finalize coupe a la cible exacte.
@@ -1702,7 +1860,9 @@ def search_cache(filters=None, keyword=""):
         "clusters": [],
         "shops": shops,
     }
-    # coupe a EXACTEMENT target_count + diversifie les niches
+    # coupe a EXACTEMENT target_count + diversifie les niches.
+    # Anti-doublon actif AUSSI en cache (regle utilisateur: jamais 2x la meme boutique,
+    # meme depuis la base locale). reset_shown() pour tout re-autoriser.
     return finalize(res, target=tc, min_per_niche=f.get("min_per_niche", 1))
 
 # ---------------- scraping navigateur (0 API) ----------------
@@ -1813,6 +1973,10 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
     # qu'il RESTE >= target_count boutiques EN NICHE apres filtrage.
     gate_on = bool(f.get("use_ai", True) or f.get("validate_ali"))
     collect_target = (target_count * 2 if gate_on else target_count)
+    # MINIMUM 30 boutiques EN NICHE avant analyse drop (regle utilisateur).
+    if gate_on:
+        collect_target = max(collect_target, 30)
+    shown_ledger = set() if f.get("allow_repeat") else _shown_load()
     # STAGNATION: si on scrape beaucoup SANS garder de nouvelle boutique (niche epuisee dans
     # la fenetre courante OU Etsy bloque/reboucle), on s'arrete et on REND DIRECT au lieu de
     # tourner en boucle. Plafond de boutiques scrapees depuis le dernier "keep".
@@ -1852,6 +2016,10 @@ def run_scrape(keyword="", target_count=30, filters=None, progress=None, stop=No
         for name, sample in found:
             if name in seen: continue
             seen.add(name)
+            # DEJA DONNE: boutique rendue dans un run precedent => sautee avant le chargement
+            # lourd de sa page (0 ressource gaspillee, jamais re-affichee).
+            if shown_ledger and ("n:" + (name or "").strip().lower()) in shown_ledger:
+                continue
             if _sample_is_bad(sample, f):
                 skipped_pre += 1; continue
             samples[name] = sample
@@ -2126,6 +2294,17 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     if kw_rel and ai_available() and not f.get("use_ai"):
         f["use_ai"] = True
         f.setdefault("_ai_auto", True)
+    # CATEGORIE vs MOT-PRODUIT: un mot-cle comme "kitchen" est une CATEGORIE (les vrais produits
+    # cuisine = "cutting board", "spice jar"... ne contiennent PAS le mot "kitchen"). Le filtre
+    # LITTERAL (titre doit contenir "kitchen") jetait alors 99% des vraies boutiques cuisine =>
+    # 400 analysees -> 3 gardees. Quand l'IA juge la niche (elle LIT tout le catalogue et tranche
+    # semantiquement), on DESACTIVE les coupes litterales (pre-filtre distinctif + dominance) qui
+    # ne servaient que de proxy gratuit SANS IA. L'IA scout fait le tri => on recupere les vraies
+    # boutiques cuisine. Sans IA, on garde les filtres litteraux (precision a moindre cout).
+    ai_judges = bool(f.get("use_ai")) and ai_available()
+    if ai_judges:
+        rel_strong = []      # plus de pre-filtre litteral par titre (l'IA juge le catalogue)
+        rel_min = 0.0        # plus de gate dominance litterale
     # ROTATION: chaque run repart la ou le precedent s'est arrete (par mot-cle) =>
     # on scanne de NOUVELLES pages de nouveautes => on ne retombe plus toujours sur
     # les memes boutiques / memes niches.
@@ -2155,6 +2334,12 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
     # resultat final < target). Additif + borne pour ne pas exploser les credits.
     gate_on = bool(f.get("use_ai") or f.get("validate_ali"))
     collect_target = min(target_count * 4, target_count + 25) if gate_on else target_count
+    # MINIMUM 30 boutiques EN NICHE avant l'analyse drop (regle utilisateur): on ne peut pas
+    # juger une niche sur 2-3 boutiques. On collecte donc au moins 30 candidats en-niche (si
+    # le filon le permet) avant de lancer l'analyse image/drop couteuse.
+    if gate_on:
+        collect_target = max(collect_target, 30)
+    shown_ledger = set() if f.get("allow_repeat") else _shown_load()
     while len(shops) < collect_target and pg < start_pg + 120 and pg < MAX_PAGE + 5 \
           and (listing_calls + enriched_calls) < max_api and not _stopped(stop):
         q = f"?limit=100&offset={pg*100}&sort_on=created&sort_order=down"
@@ -2199,6 +2384,10 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
             sid = str(L.get("shop_id") or "")
             if not sid or sid in processed: continue
             processed.add(sid)
+            # DEJA DONNE: boutique rendue dans un run precedent => on la SAUTE avant tout
+            # enrichissement (0 credit gaspille, jamais re-affichee).
+            if shown_ledger and ("i:" + sid.lower()) in shown_ledger:
+                continue
             sample = L.get("title", "")[:90]
             if sid in cache and cache[sid].get("sold") is not None:
                 c = dict(cache[sid]); c["sample"] = sample or c.get("sample", "")
@@ -2221,11 +2410,14 @@ def run_discovery(keyword="", target_count=100, max_api=500, filters=None, progr
         keep_recs = []
         for rec in cached_recs + fetched:
             if rec.get("error") or rec.get("sold") is None: continue
-            if rec["rate"] < f.get("min_rate", 0): continue
-            if rec["months"] > f.get("max_age_months", 999): continue
-            if rec["months"] < f.get("min_age_months", 0): continue
-            if rec["sold"] < f.get("min_sold", 0): continue
-            if f.get("exclude_digital", True) and rec["digital_pct"] >= 50: continue
+            # .get defensif: un record d'age inconnu (months=None) ne doit pas crasher le filtre
+            # par TypeError (None > int interdit en Py3). Valeurs neutres par defaut.
+            if (rec.get("rate") or 0) < f.get("min_rate", 0): continue
+            _m = rec.get("months")
+            if _m is not None and _m > f.get("max_age_months", 999): continue
+            if (_m or 0) < f.get("min_age_months", 0): continue
+            if (rec.get("sold") or 0) < f.get("min_sold", 0): continue
+            if f.get("exclude_digital", True) and (rec.get("digital_pct") or 0) >= 50: continue
             if f.get("exclude_custom_shops") and rec.get("accepts_custom"): continue
             # Astuce dropship: boutiques localisees en Chine/Hong Kong revendent souvent
             # des produits AliExpress => filtrer dessus AVANT Lens augmente fortement le
@@ -2498,7 +2690,10 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
             sid = str(s.get("id"))
             if sid == src_id or (s.get("name") or "").lower() == src_nm:
                 continue                    # jamais la boutique source elle-meme
-            if sid in seen:
+            # cle de dedup ROBUSTE: si id manquant/None, deux boutiques distinctes auraient la
+            # meme cle "None" => la 2e serait jetee a tort. On retombe sur le nom dans ce cas.
+            dk = sid if (sid and sid != "None") else "n:" + (s.get("name") or "").lower()
+            if dk in seen:
                 continue
             # GATE sur le signal PROFIL (ai_dropship + coherence + age), pas le seul ai_dropship:
             # un artisan etabli coherent tombe sous le seuil meme si un titre parait generique.
@@ -2506,7 +2701,7 @@ def find_similar_shops(shop_input="", target_count=30, max_api=600, filters=None
             if ad is None: ad = s.get("ai_dropship")
             if collect_min > 0 and (ad is None or ad < collect_min):
                 continue                    # GATE collecte tolerant; le tri final tranche
-            seen[sid] = s; merged.append(s); added += 1
+            seen[dk] = s; merged.append(s); added += 1
         return added
 
     # COLLECTE SUR-ECHANTILLONNEE: le drop est RARE dans une niche artisanale; pour rendre N
@@ -2730,9 +2925,10 @@ def _ali_text_validate(shops, nprod, min_match, sim_thresh):
                 break
             best, best_it = 0.0, ""
             for it in items:
-                sim = _ali_sim(t, it)
+                cand = it.get("title", "") if isinstance(it, dict) else it
+                sim = _ali_sim(t, cand)
                 if sim > best:
-                    best, best_it = sim, it
+                    best, best_it = sim, cand
             if best >= sim_thresh:
                 hits += 1
                 matches.append({"etsy": t[:60], "ali": best_it[:60], "via": "texte", "sim": round(best, 2)})
@@ -2802,7 +2998,36 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
             s["ali_hits"] = 0; s["ali_via"] = {}; s["ali_blocked"] = False
             s["ali_matches"] = []; s["ali_validated"] = None
         return 0
+    # BUDGET TEMPS (anti-hang): Lens est lent (~5-10s/produit, 1 Chrome). Sur 30+ boutiques x
+    # demi-catalogue la validation peut depasser 10min => le run "ne rend rien" (timeout). On
+    # borne le TEMPS TOTAL de validation: passe ce budget, les boutiques restantes ne sont PAS
+    # testees (ali_validated=None) et ressortent en-niche (filet below_threshold) => l'utilisateur
+    # a TOUJOURS des resultats vite, les drops confirmes en tete. Reglable via ALI_TIME_BUDGET (s).
+    try: _ali_budget = float(os.environ.get("ALI_TIME_BUDGET", "150"))
+    except Exception: _ali_budget = 150.0
+    _ali_start = time.time()
+    # COUPE-CIRCUIT MID-BOUTIQUE: une SEULE boutique (jusqu'a 20 produits x Lens) peut deja
+    # depasser le budget. Un check entre boutiques ne suffit pas. On arme un Timer qui SET un
+    # event de budget; validate_shop (ali_image) verifie cet event entre chaque produit =>
+    # l'analyse s'interrompt MEME au milieu d'une boutique des que le budget est atteint. On
+    # combine avec le stop utilisateur en un seul objet "is_set()".
+    _budget_ev = threading.Event()
+    _timer = None
+    if _ali_budget > 0:
+        _timer = threading.Timer(_ali_budget, _budget_ev.set); _timer.daemon = True; _timer.start()
+    class _ComboStop:
+        def is_set(self):
+            return _budget_ev.is_set() or (stop is not None and stop.is_set())
+    combo = _ComboStop()
+    def _over_budget():
+        return _budget_ev.is_set()
     for s in shops:
+        if _over_budget():
+            # budget epuise: boutique non testee => verdict inconnu (montree en-niche par le filet)
+            s.setdefault("ali_validated", None); s.setdefault("ali_hits", 0)
+            s.setdefault("ali_blocked", False); s.setdefault("ali_matches", [])
+            s["ali_skipped_timebudget"] = True
+            continue
         if _stopped(stop):
             # STOP demande: les boutiques non encore testees restent sans verdict (None)
             s.setdefault("ali_validated", None); s.setdefault("ali_hits", 0)
@@ -2869,7 +3094,7 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         for _try in range(2):
             try:
                 r = ali_image.validate_shop(products, min_match=min_match, sim_thresh=sim_thresh,
-                                            test_all=True, stop=stop)
+                                            test_all=True, stop=combo)
                 break
             except Exception:
                 r = None
@@ -2896,13 +3121,29 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # hash perceptuel deterministe). detail_same = preuves; detail_diff = faux positifs coupes.
         s["ali_detail_same"] = 0; s["ali_detail_diff"] = 0
         if use_vision:
-            for m in (r.get("matches", []) or []):
-                if m.get("strength") not in ("exact", "strong"):
-                    continue
+            # JUGE VISION SUR TOUS LES CANDIDATS LENS (pas que les matchs hash exact/strong):
+            # le hash perceptuel exige une photo quasi-identique => il rate le drop quand le
+            # vendeur a re-photographie / rebrande le produit. On laisse donc l'IA comparer
+            # l'OBJET (couleurs/motifs/proportions/taille) sur CHAQUE candidat qui a une
+            # vignette AliExpress, meme si le hash est faible. Borne a VISION_CMP_CAP appels
+            # par boutique (cout/temps). Priorise les candidats au hash le + fort.
+            cands = [m for m in (r.get("matches", []) or [])
+                     if m.get("src_img") and m.get("ali_img")]
+            _rank = {"exact": 0, "strong": 1, "weak": 2, None: 3}
+            cands.sort(key=lambda m: _rank.get(m.get("strength"), 3))
+            cap = int(os.environ.get("VISION_CMP_CAP", "3"))
+            for m in cands[:cap]:
+                if _stopped(combo):
+                    break
+                # vision bornee par le MEME budget temps que Lens (sinon 12 appels x 30 boutiques
+                # = plusieurs min hors-budget). Passe le budget => on arrete de comparer.
+                if _over_budget():
+                    break
                 same = _vision_same_product(m.get("src_img"), m.get("ali_img"))
                 m["detail_same"] = same
                 if same is True:
                     s["ali_detail_same"] += 1
+                    m["vision_confirmed"] = True
                 elif same is False:
                     s["ali_detail_diff"] += 1
         # SIGNAL TEXTE (dropshippers a photos custom, ex Kitchenova): produits generiques
@@ -2916,7 +3157,12 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         # lui via la coherence catalogue (gratuite). N'activer que si budget OK (~$0.0024/recherche).
         if use_vision:
             try:
-                s["ai_photo_drop"] = ai_photo_drop_signal(s.get("images") or [])
+                # photos a analyser: en mode SCRAPE s["images"]; en mode API les vraies images
+                # produit chargees pour Lens (products[].image_url) => le signal "photos artisan
+                # vs studio/IA" marche aussi en API (sinon il etait toujours None => veto inactif).
+                _photo_imgs = (s.get("images") or
+                               [p.get("image_url") for p in products if p.get("image_url")])[:6]
+                s["ai_photo_drop"] = ai_photo_drop_signal(_photo_imgs)
             except Exception:
                 s["ai_photo_drop"] = None
         else:
@@ -3100,4 +3346,6 @@ def validate_shops_ali(shops, nprod=10, min_match=3, sim_thresh=0.30, use_image=
         else:
             # pas valide par IMAGE: confirme si consensus TEXTE+IA (photo custom) OU profil fort.
             s["dropship_confirmed"] = True if (text_consensus or profile_boost) else False
+    if _timer:
+        _timer.cancel()
     return api

@@ -136,6 +136,24 @@
     <button class="sec" onclick="exportCsv()">⬇ Export CSV</button>
 
     <details style="margin-top:14px" open>
+      <summary>🧭 Niche Finder — pas d'idée de niche ?</summary>
+      <div class="tip">Tu ne sais pas dans quelle niche te lancer ? L'IA propose des niches candidates, puis analyse pour CHACUNE : combien de boutiques font du dropshipping AliExpress + la demande (acheteurs). 2 phases : estimation rapide sur beaucoup de niches → preuve image sur le TOP. Évite de te lancer à l'aveugle dans une niche pauvre en drop (ex : cuisine).</div>
+      <label style="margin-top:6px">Mode</label>
+      <select id="nf_mode">
+        <option value="scrape">Scraping (0 crédit, navigateur, lent)</option>
+        <option value="api">API Etsy (crédits, + rapide, demande exacte)</option>
+      </select>
+      <div class="row" style="margin-top:6px">
+        <div style="flex:1"><label>Niches à tester</label><input id="nf_candidates" type="number" value="15" min="2" max="30"></div>
+        <div style="flex:1"><label>Boutiques/niche</label><input id="nf_sample" type="number" value="6" min="2" max="15"></div>
+        <div style="flex:1"><label>Top à prouver (image)</label><input id="nf_deep" type="number" value="3" min="0" max="8"></div>
+      </div>
+      <button id="nfgo" onclick="nicheFinder()" style="margin-top:8px">🧭 Trouver des niches à fort drop</button>
+      <button id="nfstop" class="sec" onclick="stopSearch()" style="display:none;margin-top:6px;background:#c0392b;color:#fff">⏹ Arrêter & garder les résultats</button>
+      <div class="tip" style="margin-top:6px">Les niches déjà proposées ne sont <b>jamais reproposées</b> (anti-doublon entre recherches). <a href="#" id="nfreset" onclick="nfResetHistory(event)">Réinitialiser l'historique des niches</a> pour tout réautoriser.</div>
+    </details>
+
+    <details style="margin-top:14px" open>
       <summary>🧬 Boutiques similaires (clone finder)</summary>
       <div class="tip">Colle le lien OU le nom d'une boutique Etsy. L'IA scanne TOUT son catalogue, déduit son type de produits, puis trouve d'autres boutiques vendant la même chose — produits trouvables sur AliExpress. Utilise les mêmes filtres ci-dessus.</div>
       <input id="sim_shop" placeholder="ex: https://www.etsy.com/shop/NomBoutique  ·  ou  NomBoutique" style="margin-top:6px">
@@ -187,6 +205,7 @@ const srcEl=document.getElementById("source"),hintEl=document.getElementById("sr
 srcEl.onchange=()=>hintEl.textContent=HINTS[srcEl.value];hintEl.textContent=HINTS.cache;
 
 const val=id=>document.getElementById(id).value, chk=id=>document.getElementById(id).checked;
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function params(){
   return new URLSearchParams({
     source:val("source"), keyword:val("keyword"), target_count:val("target"),
@@ -320,6 +339,84 @@ function render(r){
     <h3 onclick="const d=this.nextElementSibling;d.style.display=d.style.display==='none'?'block':'none'">
       <span>📦 <b>${n.niche}</b></span><span class="pill">${n.count} boutiques</span></h3>
     <div style="display:${i<3?'block':'none'}">${tbl(n.shops)}</div></div>`).join("");
+}
+// ----- NICHE FINDER -----
+async function nfResetHistory(e){
+  if(e)e.preventDefault();
+  if(!confirm("Réautoriser toutes les niches déjà proposées ? (l'IA pourra à nouveau les suggérer)"))return;
+  const a=document.getElementById("nfreset");const old=a?a.textContent:"";
+  if(a)a.textContent="…";
+  try{await fetch("/api/niche_finder_reset");if(a)a.textContent="historique réinitialisé ✓";}
+  catch(_){if(a)a.textContent="échec, réessaie";}
+  setTimeout(()=>{if(a)a.textContent="Réinitialiser l'historique des niches";},2500);
+}
+function nicheFinder(){
+  const btn=document.getElementById("nfgo");btn.disabled=true;btn.innerHTML='<span class="spin"></span> Analyse des niches…';
+  const nfstop=document.getElementById("nfstop");
+  if(_es){_es.close();_es=null;}
+  document.getElementById("clusters").innerHTML="";
+  document.getElementById("stat").innerHTML=`<div style="width:100%;color:var(--mut)"><span class="spin"></span> Génération des niches candidates par l'IA…</div>`;
+  function endBtns(){btn.disabled=false;btn.textContent="🧭 Trouver des niches à fort drop";
+    if(nfstop)nfstop.style.display="none";}
+  _sid=newSid();if(nfstop)nfstop.style.display="block";
+  const p=new URLSearchParams({mode:val("nf_mode"),n_candidates:val("nf_candidates"),
+    sample_per_niche:val("nf_sample"),deep_top:val("nf_deep"),sid:_sid});
+  const live={}; // niche -> ligne live
+  _es=new EventSource("/api/niche_finder_stream?"+p.toString());
+  _es.onmessage=(ev)=>{
+    let m;try{m=JSON.parse(ev.data);}catch(e){return;}
+    if(m.type==="candidates"){
+      document.getElementById("stat").innerHTML=`<div style="width:100%;color:var(--mut)"><span class="spin"></span> ${m.niches.length} niches à analyser (mode ${m.mode})… Phase 1 : estimation rapide du drop.</div>`;
+      m.niches.forEach(n=>live[n]={niche:n});nfRenderLive(live);
+    }else if(m.type==="phase1"){
+      document.getElementById("stat").innerHTML=`<div style="width:100%;color:var(--mut)"><span class="spin"></span> Phase 1 ${m.i}/${m.total} — analyse de « ${m.niche} »…</div>`;
+    }else if(m.type==="phase1_done"){
+      live[m.niche]={niche:m.niche,demand:m.demand,drop_est_pct:m.drop_est_pct,sampled:m.sampled,blocked:m.blocked,phase:1};nfRenderLive(live);
+    }else if(m.type==="phase2"){
+      document.getElementById("stat").innerHTML=`<div style="width:100%;color:var(--mut)"><span class="spin"></span> Phase 2 ${m.i}/${m.total} — preuve image sur « ${m.niche} » (Lens+vision)…</div>`;
+    }else if(m.type==="phase2_done"){
+      live[m.niche]=Object.assign(live[m.niche]||{niche:m.niche},{drop_proven_pct:m.drop_proven_pct,drop_confirmed:m.drop_confirmed,phase:2});nfRenderLive(live);
+    }else if(m.type==="done"){_es.close();_es=null;nfRender(m.result);endBtns();quota();}
+    else if(m.type==="error"){_es.close();_es=null;
+      document.getElementById("stat").innerHTML='<div class="empty">Erreur: '+m.error+'</div>';endBtns();}
+  };
+  _es.onerror=()=>{if(_es){_es.close();_es=null;}
+    document.getElementById("stat").innerHTML='<div class="empty">Connexion interrompue. Relance.</div>';endBtns();};
+}
+function nfRenderLive(live){
+  const rows=Object.values(live);
+  const c=document.getElementById("clusters");
+  c.innerHTML=`<table class="t"><thead><tr><th>Niche</th><th>Demande</th><th>Drop estimé</th><th>Drop prouvé</th></tr></thead><tbody>`+
+    rows.map(r=>`<tr><td>${esc(r.niche)}</td><td>${r.demand??"—"}</td>
+      <td>${r.blocked?"<span style='color:#e67e22'>⛔ bloqué</span>":(r.drop_est_pct!=null?r.drop_est_pct+"%":(r.phase?"—":"<span class=mut>…</span>"))}</td>
+      <td>${r.drop_proven_pct!=null?"<b style='color:var(--ok)'>"+r.drop_proven_pct+"%</b>":"—"}</td></tr>`).join("")+
+    `</tbody></table>`;
+}
+function nfRender(r){
+  const ns=r.niches||[];
+  document.getElementById("stat").innerHTML=`
+    <div><b>${ns.length}</b><span>niches analysées</span></div>
+    <div><b>${r.deep_top}</b><span>prouvées (image)</span></div>
+    <div><b>${r.generated_by==="ia"?"IA":"liste"}</b><span>source niches</span></div>
+    <div><b>${r.niche_history_count??"?"}</b><span>déjà proposées</span></div>
+    <div><b>${r.quota_remaining??"?"}</b><span>quota restant</span></div>`;
+  const c=document.getElementById("clusters");
+  if(!ns.length){c.innerHTML='<div class="empty">Aucune niche analysée. Réessaie (scraping bloqué ?).</div>';return;}
+  c.innerHTML=`<div class="tip" style="margin-bottom:8px">Classées par potentiel = beaucoup de dropshippers + de la demande. 🟢 = drop PROUVÉ par image (top niches). Lance une recherche normale sur la niche choisie pour sortir les boutiques.</div>`+
+    ns.map((n,i)=>`<div class="niche">
+      <h3 onclick="const d=this.nextElementSibling;d.style.display=d.style.display==='none'?'block':'none'">
+        <span>${n.phase===2?"🟢":"📦"} <b>${esc(n.niche)}</b> <span class="mut" style="font-weight:400">· ${esc((n.products||[]).join(", "))}</span></span>
+        <span class="pill">score ${n.score}</span></h3>
+      <div style="display:${i<3?'block':'none'};padding:8px 10px">
+        <div class="row" style="gap:14px;flex-wrap:wrap">
+          <div><b>${n.demand??"—"}</b><span class="mut"> annonces (demande)</span></div>
+          ${n.blocked?`<div><b style="color:#e67e22">⛔ non testé</b><span class="mut"> (scraping bloqué — 429)</span></div>`:
+            `<div><b>${n.drop_est_pct??0}%</b><span class="mut"> drop estimé (${n.drop_n_est}/${n.sampled})</span></div>`}
+          ${n.drop_proven_pct!=null?`<div><b style="color:var(--ok)">${n.drop_proven_pct}%</b><span class="mut"> drop PROUVÉ image (${n.drop_confirmed} confirmé·s)</span></div>`:""}
+        </div>
+        ${(n.examples&&n.examples.length)?`<div style="margin-top:6px">Exemples drop confirmé : `+
+          n.examples.map(x=>`<a href="${x.url||'#'}" target="_blank">${esc(x.name||'?')}</a> <span class="mut">(${x.conf??"?"}%)</span>`).join(" · ")+`</div>`:""}
+      </div></div>`).join("");
 }
 // ----- BOUTIQUES SIMILAIRES -----
 function simParams(){

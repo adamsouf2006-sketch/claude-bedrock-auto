@@ -517,8 +517,11 @@ async def _yandex_ali_search(pg, image_url):
     return list(acc.values())
 
 async def _ali_text_search(pg, query):
-    """Recherche texte AliExpress -> [titres resultats]. Fallback fiable.
-    Slug AliExpress = mots separes par des TIRETS (pas %20), sinon 0 resultat."""
+    """Recherche texte AliExpress -> [{title, img}]. Fallback fiable (session vrai-Chrome, pas
+    captcha-walled comme scrapling). Slug AliExpress = mots separes par des TIRETS (pas %20),
+    sinon 0 resultat. On capture aussi la VIGNETTE produit de chaque carte: elle permet une
+    confirmation VISUELLE 'meme objet' (juge vision cote etsy_core) => preuve drop quasi-certaine
+    sur les gadgets generiques (cuisine: silicone/inox/plastique) que la recherche par image rate."""
     slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-") or "gift"
     url = ("https://www.aliexpress.com/w/wholesale-" + slug + ".html"
            "?SearchText=" + urllib.parse.quote(query))
@@ -528,8 +531,18 @@ async def _ali_text_search(pg, query):
         await _dismiss_overlays(pg)
         await pg.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await pg.wait_for_timeout(1200)
-        return await pg.evaluate("""()=>{const o=[];document.querySelectorAll('a[href*="/item/"]').forEach(a=>{
-            const t=(a.textContent||'').trim();if(t&&t.length>15)o.push(t.slice(0,90));});return [...new Set(o)].slice(0,10);}""")
+        # title = alt de l'<img> de la carte (le textContent de l'<a> est souvent vide); img = src
+        # (gere le lazy-load: src/data-src/srcset). On dedup par titre.
+        return await pg.evaluate("""()=>{const out=[],seen=new Set();
+            document.querySelectorAll('a[href*="/item/"]').forEach(a=>{
+              const im=a.querySelector('img');
+              let t=(a.textContent||'').trim(); if(!t&&im) t=(im.getAttribute('alt')||'').trim();
+              if(!t||t.length<15||seen.has(t))return;
+              let g=''; if(im){g=im.getAttribute('src')||im.getAttribute('data-src')||'';
+                if(!g){const ss=im.getAttribute('srcset')||'';if(ss)g=ss.split(',')[0].trim().split(' ')[0];}
+                if(g.startsWith('//'))g='https:'+g;}
+              seen.add(t); out.push({title:t.slice(0,90), img:g});
+            });return out.slice(0,10);}""")
     except Exception:
         return []
 
@@ -826,6 +839,11 @@ def _build_detail(title, results, src, verified=False, dmin=None):
     Prix = MEDIANE de TOUTES les cartes (le moteur image melange le produit et des accessoires
     cheap; la mediane sur l'ensemble est le cout d'achat le + representatif). Le prix reste
     indicatif: la marge dropship sature de toute facon a 5x => le verdict est robuste au bruit."""
+    # guard total: tous les appelants gardent deja `if results`, mais sans liste un scored[0]
+    # leverait IndexError. On rend la fonction sure quel que soit l'appelant (anti-footgun futur).
+    if not results:
+        return {"ali": "", "n": 0, "n_unique": 0, "sim": 0.0, "strength": "none",
+                "points": _POINTS["none"], "src": src, "verified": False}
     scored = sorted(((_sim(title, (r.get("txt") or "")), r) for r in results), key=lambda x: -x[0])
     best_sim, best = scored[0]
     _, n_unique = _dedup_unique(results)
@@ -916,6 +934,13 @@ async def _check_lens(pg, prod):
     if TEXT_FALLBACK:
         tdet = await _text_signal(pg, title)
         if tdet:
+            # PREUVE VISION sur le signal texte: on attache la photo Etsy testee (src_img). Avec
+            # la vignette AliExpress (ali_img, posee par _text_signal), etsy_core demande au JUGE
+            # VISION si c'est le MEME objet => le produit generique trouve en texte devient une
+            # preuve 'meme produit' (ali_detail_same) au lieu d'un simple signal annexe. C'est ce
+            # qui confirme le drop CUISINE (gadgets generiques) que l'image inversee rate.
+            if imgs and tdet.get("ali_img"):
+                tdet["src_img"] = imgs[0]
             return (False, "text", tdet)
     return (False, "image", {"n": 0})
 
@@ -927,11 +952,14 @@ async def _text_signal(pg, title):
     if not q:
         return {}
     try:
-        titles = await _ali_text_search(pg, q)
+        rows = await _ali_text_search(pg, q)
     except Exception:
         return {}
-    if not titles:
+    if not rows:
         return {}
+    # rows = [{title, img}] (compat: tolere d'anciennes listes de chaines)
+    rows = [(r if isinstance(r, dict) else {"title": r, "img": ""}) for r in rows]
+    titles = [r.get("title", "") for r in rows]
     # CROSS-LANGUE: AliExpress renvoie des titres traduits (francais) alors que le titre Etsy
     # est anglais => la similarite de titre est ~0 et ne marche pas. Le vrai signal = AliExpress
     # remonte BEAUCOUP de resultats pour la requete SPECIFIQUE (mots-cles produit). Un produit
@@ -943,6 +971,11 @@ async def _text_signal(pg, title):
     text_match = (len(titles) >= TEXT_MIN_RESULTS) or (best >= TEXT_SIM_MIN)
     det = {"text_match": bool(text_match), "text_sim": round(best, 2),
            "n": len(titles), "strength": "text", "points": 0}
+    # VIGNETTE du candidat le PLUS proche (par sim titre) qui a une image => confirmation vision
+    # 'meme objet' en aval (etsy_core). C'est ce qui transforme le signal texte (annexe) en PREUVE
+    # quasi-certaine sur les gadgets generiques que l'image inversee rate. '' si aucune vignette.
+    cand = sorted(((_sim(title, r.get("title", "")), r) for r in rows), key=lambda x: -x[0])
+    det["ali_img"] = next((r.get("img") for _s, r in cand if r.get("img")), "")
     if prices:
         det["ali_price"] = round(prices[len(prices)//2], 2)
     return det
@@ -1271,7 +1304,10 @@ async def _validate(products, min_match, hash_thresh, sim_thresh, headless, test
             outcome = await _drive(p)
     res["text_hits"] = 0
     for prod in products:
-        hit, via, detail = outcome[id(prod)]
+        # .get defensif: si _drive a ete coupe (stop/budget) avant de tester un produit, son id
+        # est absent d'outcome => sans defaut on leverait KeyError et on cramerait le retry de la
+        # boutique pour rien. Produit non teste = non-hit "skipped".
+        hit, via, detail = outcome.get(id(prod), (False, "skipped", {}))
         res["checked"] += 1
         res["via"][via] = res["via"].get(via, 0) + 1
         if hit:
