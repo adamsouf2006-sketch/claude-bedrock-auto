@@ -441,6 +441,18 @@ def test_agents():
     conf, ok = agents.referee(s)
     check("profil seul plafonne", (not ok) and conf <= 0.45, str((conf, ok)))
 
+    # 4b) CAS REEL (nestgestaltung): VIEIL artisan (94 mois) avec IA brute HAUTE (0.7) et SANS
+    #     preuve image => l'age plafonne le profil a 0.20 => referee NE confirme PAS (0% drop).
+    #     Verrouille le faux positif signale par l'utilisateur.
+    import etsy_core as _e2
+    old_art = {"name": "nestgestaltung", "country": "DE", "months": 94, "ai_dropship": 0.7,
+               "titles": ["spice rack wood", "wall organizer", "kitchen shelf"]}
+    prof = _e2.profile_drop_score(old_art)
+    check("vieux artisan profil bas", prof is not None and prof <= 0.20, "prof=" + str(prof))
+    old_art["ai_profile_drop"] = prof
+    conf_oa, ok_oa = agents.referee(old_art)
+    check("vieux artisan non confirme", (not ok_oa) and conf_oa < 0.55, str((conf_oa, ok_oa)))
+
     # 5) vision CONTREDIT (plus de 'differents' que 'meme') => confiance rabaissee
     s = {"ali_detail_same": 1, "ali_detail_diff": 3, "ali_validated": True,
          "country": "US", "ai_profile_drop": 0.3}
